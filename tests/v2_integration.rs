@@ -1,6 +1,7 @@
 use std::{
     path::PathBuf,
     str::FromStr,
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +25,8 @@ use sqlx::{Row, sqlite::SqliteConnectOptions};
 use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
+
+static TEMP_DATABASE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TestContext {
     state: DbState,
@@ -706,9 +709,10 @@ fn temporary_database(label: &str) -> (String, PathBuf) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
+    let counter = TEMP_DATABASE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!(
-        "pallasync-{label}-{}-{unique}.sqlite",
-        std::process::id()
+        "pallasync-{label}-{}-{unique}-{counter}.sqlite",
+        std::process::id(),
     ));
     let database_url = format!("sqlite:{}", path.to_string_lossy().replace('\\', "/"));
     (database_url, path)

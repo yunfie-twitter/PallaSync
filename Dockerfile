@@ -1,16 +1,20 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.96-bookworm AS builder
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.* ./
 COPY src ./src
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --locked --release && \
+    if [ -f Cargo.lock ]; then \
+        cargo build --locked --release; \
+    else \
+        cargo build --release; \
+    fi && \
     cp /app/target/release/pallasync-server /tmp/pallasync-server
 
 FROM debian:bookworm-slim AS runtime
@@ -34,6 +38,6 @@ EXPOSE 3000
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl --fail --silent --show-error http://127.0.0.1:3000/pallasync/v2/health || exit 1
+    CMD curl --fail --silent --show-error "http://127.0.0.1:${PORT}/pallasync/v2/health" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/pallasync-server"]
