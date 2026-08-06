@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+target
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+Dockerfile.*
+compose.override.yaml
