@@ -7,7 +7,7 @@ use axum::{
         Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header::CONTENT_TYPE},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -19,8 +19,7 @@ use uuid::Uuid;
 
 use crate::{
     crypto::verify::{
-        CTX_ADMIN_OP, CTX_CAPABILITY, CTX_DEVICE_RECORD, CTX_SYNC_RECORD,
-        verify_signed_json,
+        CTX_ADMIN_OP, CTX_CAPABILITY, CTX_DEVICE_RECORD, CTX_SYNC_RECORD, verify_signed_json,
     },
     db::DbState,
 };
@@ -159,7 +158,7 @@ pub struct FetchRecordsResponse {
     pub server_time_ms: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AdminOpRequest {
     pub protocol_version: String,
     pub chain_id: String,
@@ -335,8 +334,18 @@ pub async fn create_chain(
     let Json(params) = payload.map_err(|e| ApiError::bad_request(e.body_text()))?;
     validate_chain_id(&params.chain_id)?;
     validate_base64url("chain_salt", &params.chain_salt, Some(32), Some(32))?;
-    validate_base64url("admin_public_key", &params.admin_public_key, Some(32), Some(32))?;
-    validate_base64url("creator_public_key", &params.creator_public_key, Some(32), Some(32))?;
+    validate_base64url(
+        "admin_public_key",
+        &params.admin_public_key,
+        Some(32),
+        Some(32),
+    )?;
+    validate_base64url(
+        "creator_public_key",
+        &params.creator_public_key,
+        Some(32),
+        Some(32),
+    )?;
     validate_uuid("creator_device_id", &params.creator_device_id)?;
 
     let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
@@ -370,16 +379,30 @@ pub async fn enroll_device(
 
     let Json(req) = payload.map_err(|e| ApiError::bad_request(e.body_text()))?;
     if req.chain_id != chain_id {
-        return Err(ApiError::bad_request("chain_id in path and body must match"));
+        return Err(ApiError::bad_request(
+            "chain_id in path and body must match",
+        ));
     }
     validate_uuid("device_id", &req.device_id)?;
-    validate_base64url("device_public_key", &req.device_public_key, Some(32), Some(32))?;
+    validate_base64url(
+        "device_public_key",
+        &req.device_public_key,
+        Some(32),
+        Some(32),
+    )?;
 
     let value = serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let valid = verify_signed_json(&req.device_public_key, &req.signature, &value, CTX_DEVICE_RECORD)
-        .map_err(ApiError::bad_request)?;
+    let valid = verify_signed_json(
+        &req.device_public_key,
+        &req.signature,
+        &value,
+        CTX_DEVICE_RECORD,
+    )
+    .map_err(ApiError::bad_request)?;
     if !valid {
-        return Err(ApiError::invalid_signature("Invalid enrollment device signature"));
+        return Err(ApiError::invalid_signature(
+            "Invalid enrollment device signature",
+        ));
     }
 
     let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
@@ -447,13 +470,14 @@ pub async fn post_records(
     .await?;
 
     // Parse JSON records (can be { "records": [...] } or direct [...])
-    let records: Vec<SyncRecord> = if let Ok(wrapper) = serde_json::from_slice::<PostRecordsBody>(&body) {
-        wrapper.records
-    } else if let Ok(records) = serde_json::from_slice::<Vec<SyncRecord>>(&body) {
-        records
-    } else {
-        return Err(ApiError::bad_request("Malformed JSON records payload"));
-    };
+    let records: Vec<SyncRecord> =
+        if let Ok(wrapper) = serde_json::from_slice::<PostRecordsBody>(&body) {
+            wrapper.records
+        } else if let Ok(records) = serde_json::from_slice::<Vec<SyncRecord>>(&body) {
+            records
+        } else {
+            return Err(ApiError::bad_request("Malformed JSON records payload"));
+        };
 
     info!(chain = %short_id(&chain_id), count = records.len(), "posting sync records");
 
@@ -592,7 +616,10 @@ pub async fn get_records(
     )
     .await?;
 
-    let limit = query.limit.unwrap_or(DEFAULT_PAGE_LIMIT).min(MAX_PAGE_LIMIT) as usize;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .min(MAX_PAGE_LIMIT) as usize;
     let after_seq = if let Some(ref cur) = query.cursor {
         cur.parse::<i64>().unwrap_or(0)
     } else {
@@ -636,7 +663,11 @@ pub async fn get_records(
         });
     }
 
-    let next_cursor = if has_more { Some(max_seq.to_string()) } else { None };
+    let next_cursor = if has_more {
+        Some(max_seq.to_string())
+    } else {
+        None
+    };
     let server_time_ms = chrono::Utc::now().timestamp_millis();
 
     let resp = FetchRecordsResponse {
@@ -719,15 +750,23 @@ pub async fn update_device(
     .await?;
 
     if auth_device_id != device_id {
-        return Err(ApiError::forbidden("forbidden", "Cannot update another device's metadata"));
+        return Err(ApiError::forbidden(
+            "forbidden",
+            "Cannot update another device's metadata",
+        ));
     }
 
-    let device: DeviceRecord = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let device: DeviceRecord =
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     let value = serde_json::to_value(&device).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let valid = verify_signed_json(&device.device_public_key, &device.signature, &value, CTX_DEVICE_RECORD)
-        .map_err(ApiError::bad_request)?;
+    let valid = verify_signed_json(
+        &device.device_public_key,
+        &device.signature,
+        &value,
+        CTX_DEVICE_RECORD,
+    )
+    .map_err(ApiError::bad_request)?;
     if !valid {
         return Err(ApiError::invalid_signature("Invalid device self-signature"));
     }
@@ -760,8 +799,8 @@ pub async fn revoke_device(
     validate_uuid("device_id", &device_id)?;
     ensure_not_deleted(&state, &chain_id).await?;
 
-    let req: AdminOpRequest = serde_json::from_slice(&body)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let req: AdminOpRequest =
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     let admin_key = sqlx::query("SELECT admin_public_key FROM chains WHERE chain_id = ?")
         .bind(&chain_id)
@@ -809,7 +848,8 @@ pub async fn delete_chain(
                 .map(|r| r.get::<String, _>("admin_public_key"));
 
             if let Some(key) = admin_key {
-                let value = serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
+                let value =
+                    serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
                 let _ = verify_signed_json(&key, &req.admin_proof, &value, CTX_ADMIN_OP);
             }
         }
@@ -869,18 +909,42 @@ async fn verify_capability_token(
         .map_err(|_| ApiError::unauthorized("invalid_token", "Invalid token JSON"))?;
 
     if token.v != 1 {
-        return Err(ApiError::unauthorized("invalid_token", "Unsupported token version"));
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "Unsupported token version",
+        ));
     }
     if token.chain_id != chain_id {
-        return Err(ApiError::unauthorized("invalid_token", "Token chain_id mismatch"));
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "Token chain_id mismatch",
+        ));
     }
     if token.method.to_uppercase() != method.to_uppercase() {
-        return Err(ApiError::unauthorized("invalid_token", "Token method mismatch"));
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "Token method mismatch",
+        ));
+    }
+    if !token.path.is_empty() && token.path != path {
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "Token path mismatch",
+        ));
+    }
+    if !token.query.is_empty() && token.query != query {
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "Token query mismatch",
+        ));
     }
 
     let now_ms = chrono::Utc::now().timestamp_millis();
     if token.issued_at_ms > now_ms + 5 * 60 * 1000 {
-        return Err(ApiError::unauthorized("invalid_token", "Token issued in the future"));
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "Token issued in the future",
+        ));
     }
     if token.expires_at_ms < now_ms {
         return Err(ApiError::unauthorized("expired_token", "Token has expired"));
@@ -888,11 +952,14 @@ async fn verify_capability_token(
 
     let body_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(body));
     if !token.body_sha256.is_empty() && token.body_sha256 != body_hash {
-        return Err(ApiError::unauthorized("invalid_token", "Token body_sha256 mismatch"));
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "Token body_sha256 mismatch",
+        ));
     }
 
     let row = sqlx::query(
-        "SELECT device_public_key, status FROM devices WHERE chain_id = ? AND device_id = ?"
+        "SELECT device_public_key, status FROM devices WHERE chain_id = ? AND device_id = ?",
     )
     .bind(chain_id)
     .bind(&token.device_id)
@@ -903,22 +970,28 @@ async fn verify_capability_token(
 
     let status = row.get::<String, _>("status");
     if status != "active" {
-        return Err(ApiError::forbidden("device_revoked", "Device has been revoked"));
+        return Err(ApiError::forbidden(
+            "device_revoked",
+            "Device has been revoked",
+        ));
     }
     let pub_key = row.get::<String, _>("device_public_key");
 
-    let token_val = serde_json::to_value(&token)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let token_val =
+        serde_json::to_value(&token).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let valid = verify_signed_json(&pub_key, &token.signature, &token_val, CTX_CAPABILITY)
         .map_err(ApiError::bad_request)?;
     if !valid {
-        return Err(ApiError::unauthorized("invalid_signature", "Invalid token signature"));
+        return Err(ApiError::unauthorized(
+            "invalid_signature",
+            "Invalid token signature",
+        ));
     }
 
     // Record replay nonce
     let _ = sqlx::query(
         "INSERT INTO replay_nonces (chain_id, device_id, nonce, expires_at_ms) VALUES (?, ?, ?, ?) \
-         ON CONFLICT(chain_id, device_id, nonce) DO NOTHING"
+         ON CONFLICT(chain_id, device_id, nonce) DO NOTHING",
     )
     .bind(chain_id)
     .bind(&token.device_id)
@@ -931,12 +1004,13 @@ async fn verify_capability_token(
 }
 
 async fn ensure_not_deleted(state: &DbState, chain_id: &str) -> Result<(), ApiError> {
-    let deleted = sqlx::query("SELECT 1 FROM chains WHERE chain_id = ? AND deleted_at_ms IS NOT NULL")
-        .bind(chain_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(ApiError::database)?
-        .is_some();
+    let deleted =
+        sqlx::query("SELECT 1 FROM chains WHERE chain_id = ? AND deleted_at_ms IS NOT NULL")
+            .bind(chain_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::database)?
+            .is_some();
     if deleted {
         warn!(chain = %short_id(chain_id), "request for deleted chain");
         Err(ApiError::gone())
@@ -950,17 +1024,26 @@ fn validate_sync_record(record: &SyncRecord, path_chain_id: &str) -> Result<(), 
         return Err(ApiError::bad_request("protocol_version must be 2.1"));
     }
     if record.chain_id != path_chain_id {
-        return Err(ApiError::bad_request("chain_id in path and body must match"));
+        return Err(ApiError::bad_request(
+            "chain_id in path and body must match",
+        ));
     }
     validate_uuid("record_id", &record.record_id)?;
     validate_uuid("device_id", &record.device_id)?;
     if record.collection_name.is_empty() || record.collection_name.len() > 128 {
-        return Err(ApiError::bad_request("collection_name must contain between 1 and 128 bytes"));
+        return Err(ApiError::bad_request(
+            "collection_name must contain between 1 and 128 bytes",
+        ));
     }
     if record.action != "upsert" && record.action != "delete" {
         return Err(ApiError::bad_request("action must be upsert or delete"));
     }
-    validate_base64url("encrypted_payload", &record.encrypted_payload, Some(16), Some(MAX_CIPHERTEXT_BYTES))?;
+    validate_base64url(
+        "encrypted_payload",
+        &record.encrypted_payload,
+        Some(16),
+        Some(MAX_CIPHERTEXT_BYTES),
+    )?;
     validate_base64url("signature", &record.signature, Some(64), Some(64))?;
     Ok(())
 }
@@ -973,7 +1056,9 @@ fn validate_uuid(name: &str, value: &str) -> Result<(), ApiError> {
     let uuid = Uuid::parse_str(value)
         .map_err(|_| ApiError::bad_request(format!("{name} must be a UUID")))?;
     if uuid.to_string() != value.to_ascii_lowercase() {
-        return Err(ApiError::bad_request(format!("{name} must use canonical hyphenated UUID form")));
+        return Err(ApiError::bad_request(format!(
+            "{name} must use canonical hyphenated UUID form"
+        )));
     }
     Ok(())
 }
@@ -988,7 +1073,9 @@ fn validate_base64url(
         .decode(value)
         .map_err(|_| ApiError::bad_request(format!("{name} must be unpadded Base64URL")))?;
     if URL_SAFE_NO_PAD.encode(&decoded) != value {
-        return Err(ApiError::bad_request(format!("{name} must use canonical unpadded Base64URL")));
+        return Err(ApiError::bad_request(format!(
+            "{name} must use canonical unpadded Base64URL"
+        )));
     }
     if min_decoded_len.is_some_and(|min| decoded.len() < min)
         || max_decoded_len.is_some_and(|max| decoded.len() > max)

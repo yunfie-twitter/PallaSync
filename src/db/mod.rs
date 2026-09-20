@@ -1,8 +1,8 @@
 use sqlx::{
-    Pool, Row, Sqlite,
+    Pool, Sqlite,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
 };
-use std::{collections::HashMap, env, path::PathBuf, str::FromStr, time::Duration};
+use std::{env, path::PathBuf, str::FromStr, time::Duration};
 use tracing::info;
 
 #[derive(Clone)]
