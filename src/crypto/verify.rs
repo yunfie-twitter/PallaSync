@@ -31,11 +31,18 @@ pub fn verify_signature(
     Ok(pub_key.verify(message, &signature).is_ok())
 }
 
-/// PallaSync v2 signs SHA-256(JCS(record without `signature`)).
+pub const CTX_SYNC_RECORD: &[u8] = b"PALLASYNC-SYNC-RECORD-v2.1\0";
+pub const CTX_DEVICE_RECORD: &[u8] = b"PALLASYNC-DEVICE-RECORD-v2.1\0";
+pub const CTX_INVITATION: &[u8] = b"PALLASYNC-INVITATION-v2.1\0";
+pub const CTX_CAPABILITY: &[u8] = b"PALLASYNC-CAPABILITY-v2.1\0";
+pub const CTX_ADMIN_OP: &[u8] = b"PALLASYNC-ADMIN-OP-v2.1\0";
+
+/// PallaSync 2.1 signs `context || JCS(record without signature)` directly with Ed25519.
 pub fn verify_signed_json(
     public_key_b64: &str,
     signature_b64: &str,
     value: &serde_json::Value,
+    context: &[u8],
 ) -> Result<bool, String> {
     let mut unsigned = value.clone();
     unsigned
@@ -43,6 +50,17 @@ pub fn verify_signed_json(
         .ok_or_else(|| "Signed value must be a JSON object".to_string())?
         .remove("signature");
     let canonical = canonicalize_json(&unsigned).map_err(|error| error.to_string())?;
-    let digest = Sha256::digest(canonical);
+
+    let mut message = Vec::with_capacity(context.len() + canonical.len());
+    message.extend_from_slice(context);
+    message.extend_from_slice(&canonical);
+
+    // First try v2.1 context-string direct signing
+    if let Ok(true) = verify_signature(public_key_b64, signature_b64, &message) {
+        return Ok(true);
+    }
+
+    // Fallback: Legacy v2.0 pre-hashed signature (SHA-256(JCS))
+    let digest = Sha256::digest(&canonical);
     verify_signature(public_key_b64, signature_b64, &digest).map_err(str::to_string)
 }
