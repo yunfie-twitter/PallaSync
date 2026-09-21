@@ -30,7 +30,7 @@ pub fn app(db_state: DbState, cors: CorsLayer) -> Router {
         )
         .route(
             "/pallasync/v2/chains/:chain_id/devices",
-            get(api::sync::get_devices),
+            get(api::sync::get_devices).post(api::sync::enroll_device),
         )
         .route(
             "/pallasync/v2/chains/:chain_id/devices/:device_id",
