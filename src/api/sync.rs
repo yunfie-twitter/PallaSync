@@ -1004,18 +1004,26 @@ async fn verify_capability_token(
 }
 
 async fn ensure_not_deleted(state: &DbState, chain_id: &str) -> Result<(), ApiError> {
-    let deleted =
-        sqlx::query("SELECT 1 FROM chains WHERE chain_id = ? AND deleted_at_ms IS NOT NULL")
-            .bind(chain_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(ApiError::database)?
-            .is_some();
-    if deleted {
-        warn!(chain = %short_id(chain_id), "request for deleted chain");
-        Err(ApiError::gone())
-    } else {
-        Ok(())
+    let row = sqlx::query("SELECT deleted_at_ms FROM chains WHERE chain_id = ?")
+        .bind(chain_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::database)?;
+
+    match row {
+        Some(r) => {
+            let deleted: Option<i64> = r.get("deleted_at_ms");
+            if deleted.is_some() {
+                warn!(chain = %short_id(chain_id), "request for deleted chain");
+                Err(ApiError::gone())
+            } else {
+                Ok(())
+            }
+        }
+        None => {
+            warn!(chain = %short_id(chain_id), "request for non-existent chain");
+            Err(ApiError::not_found("chain_not_found", "Chain not found"))
+        }
     }
 }
 
