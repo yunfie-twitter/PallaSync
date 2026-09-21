@@ -81,7 +81,9 @@ async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     };
 
     if is_legacy_sync_records || is_legacy_chains {
-        tracing::warn!("Legacy pre-v2.1 database schema detected. Resetting database tables for Protocol v2.1 compatibility.");
+        tracing::warn!(
+            "Legacy pre-v2.1 database schema detected. Resetting database tables for Protocol v2.1 compatibility."
+        );
         sqlx::raw_sql(
             "DROP TABLE IF EXISTS sync_records;
              DROP TABLE IF EXISTS device_records;
@@ -135,12 +137,11 @@ mod tests {
     #[tokio::test]
     async fn test_init_fresh_db() {
         let db_state = init_db_with_url("sqlite::memory:").await.unwrap();
-        let tables: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
-        )
-        .fetch_all(&db_state.pool)
-        .await
-        .unwrap();
+        let tables: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+                .fetch_all(&db_state.pool)
+                .await
+                .unwrap();
 
         let table_names: Vec<String> = tables.into_iter().map(|(n,)| n).collect();
         assert!(table_names.contains(&"chains".to_string()));
@@ -181,15 +182,16 @@ mod tests {
         .unwrap();
 
         // Run migrate on the legacy database
-        migrate(&pool).await.expect("migrate should succeed on legacy database");
+        migrate(&pool)
+            .await
+            .expect("migrate should succeed on legacy database");
 
         // Verify that server_sequence column now exists in sync_records
-        let columns: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM pragma_table_info('sync_records')",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let columns: Vec<(String,)> =
+            sqlx::query_as("SELECT name FROM pragma_table_info('sync_records')")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
 
         let column_names: Vec<String> = columns.into_iter().map(|(n,)| n).collect();
         assert!(column_names.contains(&"server_sequence".to_string()));

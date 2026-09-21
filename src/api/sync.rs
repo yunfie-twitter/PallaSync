@@ -838,20 +838,18 @@ pub async fn delete_chain(
     ensure_not_deleted(&state, &chain_id).await?;
 
     // Verify admin proof if provided
-    if !body.is_empty() {
-        if let Ok(req) = serde_json::from_slice::<AdminOpRequest>(&body) {
-            let admin_key = sqlx::query("SELECT admin_public_key FROM chains WHERE chain_id = ?")
-                .bind(&chain_id)
-                .fetch_optional(&state.pool)
-                .await
-                .map_err(ApiError::database)?
-                .map(|r| r.get::<String, _>("admin_public_key"));
+    if let Ok(req) = serde_json::from_slice::<AdminOpRequest>(&body) {
+        let admin_key = sqlx::query("SELECT admin_public_key FROM chains WHERE chain_id = ?")
+            .bind(&chain_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::database)?
+            .map(|r| r.get::<String, _>("admin_public_key"));
 
-            if let Some(key) = admin_key {
-                let value =
-                    serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
-                let _ = verify_signed_json(&key, &req.admin_proof, &value, CTX_ADMIN_OP);
-            }
+        if let Some(key) = admin_key {
+            let value =
+                serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
+            let _ = verify_signed_json(&key, &req.admin_proof, &value, CTX_ADMIN_OP);
         }
     }
 
