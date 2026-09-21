@@ -792,7 +792,7 @@ pub async fn update_device(
 pub async fn revoke_device(
     State(state): State<DbState>,
     Path((chain_id, device_id)): Path<(String, String)>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     validate_chain_id(&chain_id)?;
@@ -831,7 +831,7 @@ pub async fn revoke_device(
 pub async fn delete_chain(
     State(state): State<DbState>,
     Path(chain_id): Path<String>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     validate_chain_id(&chain_id)?;
