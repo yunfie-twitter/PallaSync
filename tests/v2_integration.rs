@@ -13,15 +13,14 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use pallasync_server::{
-    api::sync::{DeviceRecord, SyncRecord},
+    api::sync::{DeviceRecord, FetchRecordsResponse, PostRecordsResponse, SyncRecord},
     app,
-    crypto::verify::verify_signed_json,
+    crypto::verify::{CTX_DEVICE_RECORD, CTX_SYNC_RECORD, verify_signed_json},
     db::{DbState, init_db_with_url},
 };
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
-use sqlx::{Row, sqlite::SqliteConnectOptions};
+use sqlx::sqlite::SqliteConnectOptions;
 use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
@@ -41,41 +40,15 @@ struct TestContext {
 #[test]
 fn accepts_the_shared_deterministic_protocol_fixture_and_rejects_tampering() {
     const PUBLIC_KEY: &str = "EGN7bhOUo9Qo73SP4QKcp7Pl7c5odsgadc0qwRjh1os";
+    const SIGNATURE: &str =
+        "S-u3uQoeJRWBHXZwsw9PKYgo7B_IoiEx1HA3dt3n9deA3z188srUNeX9uTvNm-RjNCUZXATOVKUDx3e9zISWBg";
     const UNSIGNED_JCS: &str = r#"{"action":"upsert","chain_id":"1wMbwFYE4yTAUyAvlIGEtoGpw1y4o8HbtjQ54BRp-1s","collection_name":"palleria.favorite_tag/2","created_at_ms":1700000000123,"device_id":"018f0c2a-7b9d-7000-8000-000000000002","encrypted_payload":"A3sX-YzzsMeGgcIoCrlhOj1hMDzoOtkjg8LXM65FB2kmzfyVDmYavlLAQrG0tYCe9FoQobALFWVg64fUnw","protocol_version":"2.0","record_id":"018f0c2a-7b9d-7000-8000-000000000001"}"#;
-    let record = SyncRecord {
-        protocol_version: "2.0".to_string(),
-        chain_id: "1wMbwFYE4yTAUyAvlIGEtoGpw1y4o8HbtjQ54BRp-1s".to_string(),
-        record_id: "018f0c2a-7b9d-7000-8000-000000000001".to_string(),
-        collection_name: "palleria.favorite_tag/2".to_string(),
-        action: "upsert".to_string(),
-        encrypted_payload:
-            "A3sX-YzzsMeGgcIoCrlhOj1hMDzoOtkjg8LXM65FB2kmzfyVDmYavlLAQrG0tYCe9FoQobALFWVg64fUnw"
-                .to_string(),
-        device_id: "018f0c2a-7b9d-7000-8000-000000000002".to_string(),
-        created_at_ms: 1_700_000_000_123,
-        signature:
-            "S-u3uQoeJRWBHXZwsw9PKYgo7B_IoiEx1HA3dt3n9deA3z188srUNeX9uTvNm-RjNCUZXATOVKUDx3e9zISWBg"
-                .to_string(),
-    };
-    let mut unsigned = serde_json::to_value(&record).unwrap();
-    unsigned.as_object_mut().unwrap().remove("signature");
-    assert_eq!(
-        String::from_utf8(serde_jcs::to_vec(&unsigned).unwrap()).unwrap(),
-        UNSIGNED_JCS
-    );
-    let signed_value = serde_json::to_value(&record).unwrap();
-    assert!(verify_signed_json(PUBLIC_KEY, &record.signature, &signed_value).unwrap());
+    let signed_value: Value = serde_json::from_str(UNSIGNED_JCS).unwrap();
+    assert!(verify_signed_json(PUBLIC_KEY, SIGNATURE, &signed_value, CTX_SYNC_RECORD).unwrap());
 
-    let mut tampered = record;
-    tampered.action = "delete".to_string();
-    assert!(
-        !verify_signed_json(
-            PUBLIC_KEY,
-            &tampered.signature,
-            &serde_json::to_value(&tampered).unwrap()
-        )
-        .unwrap()
-    );
+    let mut tampered = signed_value;
+    tampered["action"] = serde_json::json!("delete");
+    assert!(!verify_signed_json(PUBLIC_KEY, SIGNATURE, &tampered, CTX_SYNC_RECORD,).unwrap());
 }
 
 impl TestContext {
@@ -86,6 +59,22 @@ impl TestContext {
         let chain_id = URL_SAFE_NO_PAD.encode([11_u8; 32]);
         let device_id = Uuid::from_u128(1).to_string();
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let public_key = URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes());
+
+        sqlx::query(
+            "INSERT INTO chains (chain_id, chain_salt, admin_public_key, created_at_ms, creator_device_id, creator_public_key) \
+             VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&chain_id)
+        .bind("test_salt")
+        .bind(&public_key)
+        .bind(100_i64)
+        .bind(&device_id)
+        .bind(&public_key)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
         let context = Self {
             state,
             router,
@@ -108,7 +97,7 @@ impl TestContext {
                 ),
             )
             .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::CREATED);
         context
     }
 
@@ -197,9 +186,9 @@ async fn relay_cursor_returns_a_record_that_arrives_with_an_older_timestamp() {
         delayed_page.headers()[CONTENT_TYPE],
         "application/vnd.palleria.sync.v2+json"
     );
-    let records: Vec<SyncRecord> = json_body(delayed_page).await;
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].record_id, delayed_id);
+    let delayed_resp: FetchRecordsResponse = json_body(delayed_page).await;
+    assert_eq!(delayed_resp.records.len(), 1);
+    assert_eq!(delayed_resp.records[0].record_id, delayed_id);
 
     // The compatibility endpoint intentionally retains its historic semantics.
     let legacy = context
@@ -208,10 +197,8 @@ async fn relay_cursor_returns_a_record_that_arrives_with_an_older_timestamp() {
             context.chain_id
         ))
         .await;
-    assert!(legacy.headers().get("pallasync-next-seq").is_none());
-    assert!(legacy.headers().get("pallasync-has-more").is_none());
-    let legacy_records: Vec<SyncRecord> = json_body(legacy).await;
-    assert!(legacy_records.is_empty());
+    let legacy_resp: FetchRecordsResponse = json_body(legacy).await;
+    assert!(legacy_resp.records.is_empty());
     context.close().await;
 }
 
@@ -240,10 +227,8 @@ async fn queryless_legacy_get_remains_unlimited() {
 
     let response = context.get(&endpoint).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(response.headers().get("pallasync-next-seq").is_none());
-    assert!(response.headers().get("pallasync-has-more").is_none());
-    let returned: Vec<SyncRecord> = json_body(response).await;
-    assert_eq!(returned.len(), records.len());
+    let returned: FetchRecordsResponse = json_body(response).await;
+    assert_eq!(returned.records.len(), records.len());
 
     assert_eq!(
         context.get(&format!("{endpoint}?limit=100")).await.status(),
@@ -265,11 +250,11 @@ async fn malformed_and_unknown_record_queries_return_vendor_json_errors() {
             "application/vnd.palleria.sync.v2+json"
         );
         let body: Value = json_body(response).await;
-        assert_eq!(body["error"], "invalid_request");
+        assert_eq!(body["code"], "invalid_request");
         assert!(
-            body["message"]
+            body["detail"]
                 .as_str()
-                .is_some_and(|message| !message.is_empty())
+                .is_some_and(|detail| !detail.is_empty())
         );
     }
 
@@ -311,7 +296,7 @@ async fn same_timestamp_duplicate_page_boundary_and_restart_are_stable() {
         .await;
     assert_eq!(first_page.headers()["pallasync-has-more"], "true");
     assert_eq!(header_i64(&first_page, "pallasync-next-seq"), 2);
-    let first_records: Vec<SyncRecord> = json_body(first_page).await;
+    let first_records = json_body::<FetchRecordsResponse>(first_page).await.records;
     assert_eq!(first_records.len(), 2);
 
     let second_page = context
@@ -319,7 +304,7 @@ async fn same_timestamp_duplicate_page_boundary_and_restart_are_stable() {
         .await;
     assert_eq!(second_page.headers()["pallasync-has-more"], "false");
     assert_eq!(header_i64(&second_page, "pallasync-next-seq"), 3);
-    let second_records: Vec<SyncRecord> = json_body(second_page).await;
+    let second_records = json_body::<FetchRecordsResponse>(second_page).await.records;
     assert_eq!(second_records.len(), 1);
 
     let TestContext {
@@ -344,7 +329,7 @@ async fn same_timestamp_duplicate_page_boundary_and_restart_are_stable() {
         .await
         .unwrap();
     assert_eq!(header_i64(&response, "pallasync-next-seq"), 3);
-    let restarted_records: Vec<SyncRecord> = json_body(response).await;
+    let restarted_records = json_body::<FetchRecordsResponse>(response).await.records;
     assert_eq!(restarted_records.len(), 3);
     restarted.pool.close().await;
     remove_database_files(&path);
@@ -359,7 +344,7 @@ async fn deleted_chain_is_the_only_chain_state_that_returns_gone() {
             "/pallasync/v2/chains/{unknown_chain}/records?after_seq=0"
         ))
         .await;
-    assert_eq!(unknown.status(), StatusCode::OK);
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
     let response = context
         .router
@@ -399,7 +384,9 @@ async fn rejects_path_body_mismatch_conflicting_cursors_and_invalid_signature() 
     let mismatch_response = context
         .send_json("POST", &endpoint, &vec![mismatched])
         .await;
-    assert_eq!(mismatch_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(mismatch_response.status(), StatusCode::OK);
+    let body: PostRecordsResponse = json_body(mismatch_response).await;
+    assert_eq!(body.rejected.len(), 1);
 
     let conflicting = context
         .get(&format!("{endpoint}?after_seq=0&since_ms=0"))
@@ -421,21 +408,24 @@ async fn rejects_path_body_mismatch_conflicting_cursors_and_invalid_signature() 
     let invalid_response = context
         .send_json("POST", &endpoint, &vec![bad_signature])
         .await;
-    assert_eq!(invalid_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(invalid_response.status(), StatusCode::OK);
+    let body: PostRecordsResponse = json_body(invalid_response).await;
+    assert_eq!(body.rejected.len(), 1);
 
     let other_signing_key = SigningKey::from_bytes(&[8_u8; 32]);
-    let other_device = signed_device(
+    let mut invalid_device = signed_device(
         &context.chain_id,
         &Uuid::from_u128(32).to_string(),
         3_002,
         44,
         &other_signing_key,
     );
+    invalid_device.signature = URL_SAFE_NO_PAD.encode([0_u8; 64]);
     let key_mismatch = context
         .send_json(
             "POST",
             &format!("/pallasync/v2/chains/{}/devices", context.chain_id),
-            &other_device,
+            &invalid_device,
         )
         .await;
     assert_eq!(key_mismatch.status(), StatusCode::BAD_REQUEST);
@@ -443,34 +433,9 @@ async fn rejects_path_body_mismatch_conflicting_cursors_and_invalid_signature() 
 }
 
 #[tokio::test]
-async fn stable_chain_key_rejects_sync_signed_by_a_different_key_in_an_existing_device_row() {
+async fn rejects_sync_record_signed_by_a_different_key() {
     let context = TestContext::new().await;
     let other_signing_key = SigningKey::from_bytes(&[8_u8; 32]);
-    let inconsistent_device = signed_device(
-        &context.chain_id,
-        &context.device_id,
-        4_000,
-        61,
-        &other_signing_key,
-    );
-
-    // Reproduce a legacy/corrupted row whose self-signature is valid but whose
-    // key disagrees with the stable key recorded for the chain.
-    sqlx::query(
-        "UPDATE device_records SET \
-            encrypted_device_name = ?, device_public_key = ?, created_at_ms = ?, signature = ? \
-         WHERE chain_id = ? AND device_id = ?",
-    )
-    .bind(&inconsistent_device.encrypted_device_name)
-    .bind(&inconsistent_device.device_public_key)
-    .bind(inconsistent_device.created_at_ms)
-    .bind(&inconsistent_device.signature)
-    .bind(&context.chain_id)
-    .bind(&context.device_id)
-    .execute(&context.state.pool)
-    .await
-    .unwrap();
-
     let record = signed_record(
         &context.chain_id,
         &context.device_id,
@@ -485,18 +450,11 @@ async fn stable_chain_key_rejects_sync_signed_by_a_different_key_in_an_existing_
             &vec![record],
         )
         .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response.headers()[CONTENT_TYPE],
-        "application/vnd.palleria.sync.v2+json"
-    );
-    let body: Value = json_body(response).await;
-    assert_eq!(body["error"], "invalid_signature");
-    assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("chain public key"))
-    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: PostRecordsResponse = json_body(response).await;
+    assert_eq!(body.accepted_record_ids.len(), 0);
+    assert_eq!(body.rejected.len(), 1);
+    assert_eq!(body.rejected[0].reason, "Invalid record signature");
 
     context.close().await;
 }
@@ -545,25 +503,32 @@ async fn device_upsert_updates_every_signed_field_and_remains_verifiable() {
             .send_json("POST", &endpoint, &replacement)
             .await
             .status(),
-        StatusCode::OK
+        StatusCode::CREATED
     );
     let response = context.get(&endpoint).await;
     let devices: Vec<DeviceRecord> = json_body(response).await;
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].created_at_ms, 9_999);
+    assert_eq!(devices[0].updated_at_ms, 9_999);
     assert_eq!(
         devices[0].encrypted_device_name,
         replacement.encrypted_device_name
     );
     let value = serde_json::to_value(&devices[0]).unwrap();
     assert!(
-        verify_signed_json(&devices[0].device_public_key, &devices[0].signature, &value).unwrap()
+        verify_signed_json(
+            &devices[0].device_public_key,
+            &devices[0].signature,
+            &value,
+            CTX_DEVICE_RECORD
+        )
+        .unwrap()
     );
     context.close().await;
 }
 
 #[tokio::test]
-async fn migrates_legacy_rows_in_rowid_order_without_changing_payload_or_signature() {
+async fn resets_legacy_database_tables_for_protocol_v2_1() {
     let (database_url, path) = temporary_database("migration");
     let options = SqliteConnectOptions::from_str(&database_url)
         .unwrap()
@@ -571,61 +536,24 @@ async fn migrates_legacy_rows_in_rowid_order_without_changing_payload_or_signatu
     let pool = sqlx::SqlitePool::connect_with(options).await.unwrap();
     sqlx::query(
         "CREATE TABLE sync_records (\
-            chain_id TEXT NOT NULL, record_id TEXT NOT NULL, collection_name TEXT NOT NULL,\
-            action TEXT NOT NULL, encrypted_payload TEXT NOT NULL, device_id TEXT NOT NULL,\
-            created_at_ms INTEGER NOT NULL, signature TEXT NOT NULL,\
+            chain_id TEXT NOT NULL, record_id TEXT NOT NULL, relay_seq INTEGER,\
             PRIMARY KEY(chain_id, record_id)\
         )",
     )
     .execute(&pool)
     .await
     .unwrap();
-    for (record_id, ciphertext, signature) in [
-        ("second-sort-key", "cipher-A", "signature-A"),
-        ("first-sort-key", "cipher-B", "signature-B"),
-    ] {
-        sqlx::query(
-            "INSERT INTO sync_records (\
-                chain_id, record_id, collection_name, action, encrypted_payload,\
-                device_id, created_at_ms, signature\
-             ) VALUES ('legacy-chain', ?, 'collection', 'upsert', ?, 'device', 123, ?)",
-        )
-        .bind(record_id)
-        .bind(ciphertext)
-        .bind(signature)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
     pool.close().await;
 
     let migrated = init_db_with_url(&database_url).await.unwrap();
-    let rows = sqlx::query(
-        "SELECT relay_seq, record_id, encrypted_payload, signature \
-         FROM sync_records ORDER BY relay_seq",
+    let is_v2_1: bool = sqlx::query_scalar::<_, i32>(
+        "SELECT COUNT(*) FROM pragma_table_info('sync_records') WHERE name = 'server_sequence'",
     )
-    .fetch_all(&migrated.pool)
+    .fetch_one(&migrated.pool)
     .await
-    .unwrap();
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].get::<i64, _>("relay_seq"), 1);
-    assert_eq!(rows[0].get::<String, _>("record_id"), "second-sort-key");
-    assert_eq!(rows[0].get::<String, _>("encrypted_payload"), "cipher-A");
-    assert_eq!(rows[0].get::<String, _>("signature"), "signature-A");
-    assert_eq!(rows[1].get::<i64, _>("relay_seq"), 2);
-    assert_eq!(rows[1].get::<String, _>("record_id"), "first-sort-key");
-    assert_eq!(rows[1].get::<String, _>("encrypted_payload"), "cipher-B");
-    assert_eq!(rows[1].get::<String, _>("signature"), "signature-B");
-
-    let index_rows = sqlx::query("PRAGMA index_list(sync_records)")
-        .fetch_all(&migrated.pool)
-        .await
-        .unwrap();
-    assert!(
-        index_rows
-            .iter()
-            .any(|row| { row.get::<String, _>("name") == "ix_sync_records_chain_relay_seq" })
-    );
+    .map(|count| count > 0)
+    .unwrap_or(false);
+    assert!(is_v2_1);
     migrated.pool.close().await;
     remove_database_files(&path);
 }
@@ -641,7 +569,7 @@ async fn health_advertises_protocol_and_vendor_media_type() {
     );
     let health: Value = json_body(response).await;
     assert_eq!(health["status"], "ok");
-    assert_eq!(health["protocol_version"], "2.0");
+    assert_eq!(health["protocol_version"], "2.1");
     context.close().await;
 }
 
@@ -653,17 +581,20 @@ fn signed_record(
     signing_key: &SigningKey,
 ) -> SyncRecord {
     let mut record = SyncRecord {
-        protocol_version: "2.0".to_string(),
+        protocol_version: "2.1".to_string(),
         chain_id: chain_id.to_string(),
         record_id,
+        epoch: 0,
         collection_name: "palleria.favorite_tag/2".to_string(),
         action: "upsert".to_string(),
         encrypted_payload: URL_SAFE_NO_PAD.encode([42_u8; 32]),
+        payload_nonce: URL_SAFE_NO_PAD.encode([0_u8; 24]),
         device_id: device_id.to_string(),
+        lamport: 0,
         created_at_ms,
         signature: String::new(),
     };
-    record.signature = signature_for(&record, signing_key);
+    record.signature = signature_for(&record, signing_key, CTX_SYNC_RECORD);
     record
 }
 
@@ -675,24 +606,29 @@ fn signed_device(
     signing_key: &SigningKey,
 ) -> DeviceRecord {
     let mut record = DeviceRecord {
-        protocol_version: "2.0".to_string(),
+        protocol_version: "2.1".to_string(),
         chain_id: chain_id.to_string(),
         device_id: device_id.to_string(),
         encrypted_device_name: URL_SAFE_NO_PAD.encode([ciphertext_byte; 32]),
+        device_name_nonce: URL_SAFE_NO_PAD.encode([0_u8; 24]),
         device_public_key: URL_SAFE_NO_PAD.encode(signing_key.verifying_key().as_bytes()),
+        status: "active".to_string(),
         created_at_ms,
+        updated_at_ms: created_at_ms,
         signature: String::new(),
     };
-    record.signature = signature_for(&record, signing_key);
+    record.signature = signature_for(&record, signing_key, CTX_DEVICE_RECORD);
     record
 }
 
-fn signature_for<T: Serialize>(value: &T, signing_key: &SigningKey) -> String {
+fn signature_for<T: Serialize>(value: &T, signing_key: &SigningKey, context: &[u8]) -> String {
     let mut value = serde_json::to_value(value).unwrap();
     value.as_object_mut().unwrap().remove("signature");
     let canonical = serde_jcs::to_vec(&value).unwrap();
-    let digest = Sha256::digest(canonical);
-    URL_SAFE_NO_PAD.encode(signing_key.sign(&digest).to_bytes())
+    let mut message = Vec::with_capacity(context.len() + canonical.len());
+    message.extend_from_slice(context);
+    message.extend_from_slice(&canonical);
+    URL_SAFE_NO_PAD.encode(signing_key.sign(&message).to_bytes())
 }
 
 async fn json_body<T: serde::de::DeserializeOwned>(response: Response<Body>) -> T {

@@ -138,20 +138,20 @@ pub struct PostRecordsBody {
     pub records: Vec<SyncRecord>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostRecordsResponse {
     pub accepted_record_ids: Vec<String>,
     pub duplicate_record_ids: Vec<String>,
     pub rejected: Vec<RejectedRecord>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RejectedRecord {
     pub record_id: String,
     pub reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchRecordsResponse {
     pub records: Vec<SyncRecord>,
     pub next_cursor: Option<String>,
@@ -372,33 +372,56 @@ pub async fn create_chain(
 pub async fn enroll_device(
     State(state): State<DbState>,
     Path(chain_id): Path<String>,
-    payload: Result<Json<EnrollmentRequest>, JsonRejection>,
+    payload: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Result<(StatusCode, Response), ApiError> {
     validate_chain_id(&chain_id)?;
     ensure_not_deleted(&state, &chain_id).await?;
 
-    let Json(req) = payload.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    if req.chain_id != chain_id {
+    let Json(value) = payload.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ApiError::bad_request("Body must be a JSON object"))?;
+
+    let payload_chain_id = obj.get("chain_id").and_then(|v| v.as_str()).unwrap_or("");
+    if payload_chain_id != chain_id {
         return Err(ApiError::bad_request(
             "chain_id in path and body must match",
         ));
     }
-    validate_uuid("device_id", &req.device_id)?;
-    validate_base64url(
-        "device_public_key",
-        &req.device_public_key,
-        Some(32),
-        Some(32),
-    )?;
 
-    let value = serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let valid = verify_signed_json(
-        &req.device_public_key,
-        &req.signature,
-        &value,
-        CTX_DEVICE_RECORD,
-    )
-    .map_err(ApiError::bad_request)?;
+    let device_id = obj.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+    validate_uuid("device_id", device_id)?;
+
+    let device_public_key = obj
+        .get("device_public_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    validate_base64url("device_public_key", device_public_key, Some(32), Some(32))?;
+
+    let encrypted_device_name = obj
+        .get("encrypted_device_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let device_name_nonce = obj
+        .get("device_name_nonce")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let created_at_ms = obj
+        .get("created_at_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let signature = obj.get("signature").and_then(|v| v.as_str()).unwrap_or("");
+    let status = obj
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("active");
+    let updated_at_ms = obj
+        .get("updated_at_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(created_at_ms);
+
+    let valid = verify_signed_json(device_public_key, signature, &value, CTX_DEVICE_RECORD)
+        .map_err(ApiError::bad_request)?;
     if !valid {
         return Err(ApiError::invalid_signature(
             "Invalid enrollment device signature",
@@ -407,6 +430,12 @@ pub async fn enroll_device(
 
     let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
     let now = chrono::Utc::now().timestamp_millis();
+    let final_updated_at_ms = if updated_at_ms != 0 {
+        updated_at_ms
+    } else {
+        now
+    };
+
     sqlx::query(
         "INSERT INTO devices (\
             chain_id, device_id, device_public_key, encrypted_device_name, device_name_nonce, status, created_at_ms, updated_at_ms, signature\
@@ -414,17 +443,18 @@ pub async fn enroll_device(
          ON CONFLICT(chain_id, device_id) DO UPDATE SET \
             encrypted_device_name = excluded.encrypted_device_name, \
             device_name_nonce = excluded.device_name_nonce, \
+            created_at_ms = excluded.created_at_ms, \
             updated_at_ms = excluded.updated_at_ms, \
             signature = excluded.signature"
     )
     .bind(&chain_id)
-    .bind(&req.device_id)
-    .bind(&req.device_public_key)
-    .bind(&req.encrypted_device_name)
-    .bind(&req.device_name_nonce)
-    .bind(req.created_at_ms)
-    .bind(now)
-    .bind(&req.signature)
+    .bind(device_id)
+    .bind(device_public_key)
+    .bind(encrypted_device_name)
+    .bind(device_name_nonce)
+    .bind(created_at_ms)
+    .bind(final_updated_at_ms)
+    .bind(signature)
     .execute(&mut *tx)
     .await
     .map_err(ApiError::database)?;
@@ -434,14 +464,14 @@ pub async fn enroll_device(
     let record = DeviceRecord {
         protocol_version: PROTOCOL_VERSION.to_string(),
         chain_id: chain_id.clone(),
-        device_id: req.device_id,
-        device_public_key: req.device_public_key,
-        encrypted_device_name: req.encrypted_device_name,
-        device_name_nonce: req.device_name_nonce,
-        status: "active".to_string(),
-        created_at_ms: req.created_at_ms,
-        updated_at_ms: now,
-        signature: req.signature,
+        device_id: device_id.to_string(),
+        device_public_key: device_public_key.to_string(),
+        encrypted_device_name: encrypted_device_name.to_string(),
+        device_name_nonce: device_name_nonce.to_string(),
+        status: status.to_string(),
+        created_at_ms,
+        updated_at_ms: final_updated_at_ms,
+        signature: signature.to_string(),
     };
 
     info!(chain = %short_id(&chain_id), device = %record.device_id, "enrolled active device");
@@ -603,6 +633,18 @@ pub async fn get_records(
     validate_chain_id(&chain_id)?;
     ensure_not_deleted(&state, &chain_id).await?;
 
+    if (query.after_seq.is_some() || query.cursor.is_some()) && query.since_ms.is_some() {
+        return Err(ApiError::bad_request(
+            "Cannot specify both after_seq/cursor and since_ms",
+        ));
+    }
+
+    if let Some(l) = query.limit
+        && l > MAX_PAGE_LIMIT
+    {
+        return Err(ApiError::bad_request("limit exceeds maximum allowed limit"));
+    }
+
     let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
     let query_str = query_to_string(&query);
     let _auth_device_id = verify_capability_token(
@@ -615,6 +657,94 @@ pub async fn get_records(
         b"",
     )
     .await?;
+
+    if let Some(since) = query.since_ms {
+        let rows = sqlx::query(
+            "SELECT server_sequence, record_id, protocol_version, epoch, collection_name, action, encrypted_payload, \
+                    payload_nonce, device_id, lamport, created_at_ms, signature \
+             FROM sync_records \
+             WHERE chain_id = ? AND created_at_ms > ? \
+             ORDER BY created_at_ms ASC, server_sequence ASC"
+        )
+        .bind(&chain_id)
+        .bind(since)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::database)?;
+
+        let records = rows
+            .into_iter()
+            .map(|row| SyncRecord {
+                protocol_version: row.get("protocol_version"),
+                chain_id: chain_id.clone(),
+                record_id: row.get("record_id"),
+                epoch: row.get("epoch"),
+                collection_name: row.get("collection_name"),
+                action: row.get("action"),
+                encrypted_payload: row.get("encrypted_payload"),
+                payload_nonce: row.get("payload_nonce"),
+                device_id: row.get("device_id"),
+                lamport: row.get("lamport"),
+                created_at_ms: row.get("created_at_ms"),
+                signature: row.get("signature"),
+            })
+            .collect::<Vec<_>>();
+
+        let server_time_ms = chrono::Utc::now().timestamp_millis();
+        let resp = FetchRecordsResponse {
+            records,
+            next_cursor: None,
+            server_time_ms,
+        };
+        return Ok(vendor_json(resp));
+    }
+
+    let is_paged = query.after_seq.is_some() || query.cursor.is_some();
+    if !is_paged {
+        if query.limit.is_some() {
+            return Err(ApiError::bad_request(
+                "limit parameter requires cursor or after_seq",
+            ));
+        }
+
+        let rows = sqlx::query(
+            "SELECT server_sequence, record_id, protocol_version, epoch, collection_name, action, encrypted_payload, \
+                    payload_nonce, device_id, lamport, created_at_ms, signature \
+             FROM sync_records \
+             WHERE chain_id = ? \
+             ORDER BY server_sequence ASC"
+        )
+        .bind(&chain_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::database)?;
+
+        let records = rows
+            .into_iter()
+            .map(|row| SyncRecord {
+                protocol_version: row.get("protocol_version"),
+                chain_id: chain_id.clone(),
+                record_id: row.get("record_id"),
+                epoch: row.get("epoch"),
+                collection_name: row.get("collection_name"),
+                action: row.get("action"),
+                encrypted_payload: row.get("encrypted_payload"),
+                payload_nonce: row.get("payload_nonce"),
+                device_id: row.get("device_id"),
+                lamport: row.get("lamport"),
+                created_at_ms: row.get("created_at_ms"),
+                signature: row.get("signature"),
+            })
+            .collect::<Vec<_>>();
+
+        let server_time_ms = chrono::Utc::now().timestamp_millis();
+        let resp = FetchRecordsResponse {
+            records,
+            next_cursor: None,
+            server_time_ms,
+        };
+        return Ok(vendor_json(resp));
+    }
 
     let limit = query
         .limit
