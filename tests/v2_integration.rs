@@ -12,10 +12,15 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
+use sha2::{Digest, Sha256};
 use pallasync_server::{
-    api::sync::{DeviceRecord, FetchRecordsResponse, PostRecordsResponse, SyncRecord},
+    api::sync::{
+        DeviceRecord, FetchRecordsResponse, GetDevicesResponse, PostRecordsResponse, SyncRecord,
+    },
     app,
-    crypto::verify::{CTX_DEVICE_RECORD, CTX_SYNC_RECORD, verify_signed_json},
+    crypto::verify::{
+        CTX_ADMIN_OP, CTX_CAPABILITY, CTX_DEVICE_RECORD, CTX_SYNC_RECORD, verify_signed_json,
+    },
     db::{DbState, init_db_with_url},
 };
 use serde::Serialize;
@@ -85,9 +90,7 @@ impl TestContext {
             signing_key,
         };
         let response = context
-            .send_json(
-                "POST",
-                &format!("/pallasync/v2/chains/{}/devices", context.chain_id),
+            .send_enroll(
                 &signed_device(
                     &context.chain_id,
                     &context.device_id,
@@ -101,13 +104,30 @@ impl TestContext {
         context
     }
 
-    async fn send_json<T: Serialize>(&self, method: &str, uri: &str, body: &T) -> Response<Body> {
+    fn capability_token(&self, method: &str, uri: &str, body: &[u8]) -> String {
+        let (path, query) = match uri.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (uri, ""),
+        };
+        signed_capability_token(
+            &self.chain_id,
+            &self.device_id,
+            method,
+            path,
+            query,
+            body,
+            &self.signing_key,
+        )
+    }
+
+    async fn send_enroll<T: Serialize>(&self, body: &T) -> Response<Body> {
+        let uri = format!("/pallasync/v2/chains/{}/devices/enroll", self.chain_id);
         self.router
             .clone()
             .oneshot(
                 Request::builder()
-                    .method(method)
-                    .uri(uri)
+                    .method("POST")
+                    .uri(&uri)
                     .header(CONTENT_TYPE, "application/json")
                     .body(Body::from(serde_json::to_vec(body).unwrap()))
                     .unwrap(),
@@ -116,10 +136,35 @@ impl TestContext {
             .unwrap()
     }
 
-    async fn get(&self, uri: &str) -> Response<Body> {
+    async fn send_json<T: Serialize>(&self, method: &str, uri: &str, body: &T) -> Response<Body> {
+        let body_bytes = serde_json::to_vec(body).unwrap();
+        let token = self.capability_token(method, uri, &body_bytes);
         self.router
             .clone()
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Authorization", format!("PallaSync {token}"))
+                    .body(Body::from(body_bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn get(&self, uri: &str) -> Response<Body> {
+        let token = self.capability_token("GET", uri, b"");
+        self.router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("Authorization", format!("PallaSync {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap()
     }
@@ -312,17 +357,29 @@ async fn same_timestamp_duplicate_page_boundary_and_restart_are_stable() {
         database_url,
         path,
         chain_id,
+        device_id,
+        signing_key,
         ..
     } = context;
     state.pool.close().await;
     let restarted = init_db_with_url(&database_url).await.unwrap();
     let restarted_router = app(restarted.clone(), CorsLayer::permissive());
+    let token = signed_capability_token(
+        &chain_id,
+        &device_id,
+        "GET",
+        &format!("/pallasync/v2/chains/{chain_id}/records"),
+        "after_seq=0&limit=500",
+        b"",
+        &signing_key,
+    );
     let response = restarted_router
         .oneshot(
             Request::builder()
                 .uri(format!(
                     "/pallasync/v2/chains/{chain_id}/records?after_seq=0&limit=500"
                 ))
+                .header("Authorization", format!("PallaSync {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -346,6 +403,30 @@ async fn deleted_chain_is_the_only_chain_state_that_returns_gone() {
         .await;
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
 
+    let admin_req = serde_json::json!({
+        "protocol_version": "2.1",
+        "chain_id": context.chain_id,
+        "operation": "delete_chain",
+        "target_device_id": null,
+        "created_at_ms": 100,
+        "admin_proof": admin_proof_for(
+            &serde_json::json!({
+                "protocol_version": "2.1",
+                "chain_id": context.chain_id,
+                "operation": "delete_chain",
+                "target_device_id": null,
+                "created_at_ms": 100,
+            }),
+            &context.signing_key,
+        ),
+    });
+    let body_bytes = serde_json::to_vec(&admin_req).unwrap();
+    let token = context.capability_token(
+        "DELETE",
+        &format!("/pallasync/v2/chains/{}", context.chain_id),
+        &body_bytes,
+    );
+
     let response = context
         .router
         .clone()
@@ -353,7 +434,9 @@ async fn deleted_chain_is_the_only_chain_state_that_returns_gone() {
             Request::builder()
                 .method("DELETE")
                 .uri(format!("/pallasync/v2/chains/{}", context.chain_id))
-                .body(Body::empty())
+                .header(CONTENT_TYPE, "application/json")
+                .header("Authorization", format!("PallaSync {token}"))
+                .body(Body::from(body_bytes))
                 .unwrap(),
         )
         .await
@@ -469,6 +552,12 @@ async fn vendor_json_content_type_is_accepted_for_post_requests() {
         4_100,
         &context.signing_key,
     );
+    let body_bytes = serde_json::to_vec(&vec![record]).unwrap();
+    let token = context.capability_token(
+        "POST",
+        &format!("/pallasync/v2/chains/{}/records", context.chain_id),
+        &body_bytes,
+    );
     let response = context
         .router
         .clone()
@@ -477,7 +566,8 @@ async fn vendor_json_content_type_is_accepted_for_post_requests() {
                 .method("POST")
                 .uri(format!("/pallasync/v2/chains/{}/records", context.chain_id))
                 .header(CONTENT_TYPE, "application/vnd.palleria.sync.v2+json")
-                .body(Body::from(serde_json::to_vec(&vec![record]).unwrap()))
+                .header("Authorization", format!("PallaSync {token}"))
+                .body(Body::from(body_bytes))
                 .unwrap(),
         )
         .await
@@ -499,14 +589,12 @@ async fn device_upsert_updates_every_signed_field_and_remains_verifiable() {
         &context.signing_key,
     );
     assert_eq!(
-        context
-            .send_json("POST", &endpoint, &replacement)
-            .await
-            .status(),
+        context.send_enroll(&replacement).await.status(),
         StatusCode::CREATED
     );
     let response = context.get(&endpoint).await;
-    let devices: Vec<DeviceRecord> = json_body(response).await;
+    let devices_resp: GetDevicesResponse = json_body(response).await;
+    let devices = devices_resp.devices;
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0].created_at_ms, 9_999);
     assert_eq!(devices[0].updated_at_ms, 9_999);
@@ -524,6 +612,172 @@ async fn device_upsert_updates_every_signed_field_and_remains_verifiable() {
         )
         .unwrap()
     );
+    context.close().await;
+}
+
+#[tokio::test]
+async fn missing_authorization_returns_401() {
+    let context = TestContext::new().await;
+    let endpoint = format!("/pallasync/v2/chains/{}/records", context.chain_id);
+    let response = context
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&endpoint)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = json_body(response).await;
+    assert_eq!(body["code"], "missing_authorization");
+    context.close().await;
+}
+
+#[tokio::test]
+async fn replay_token_is_rejected() {
+    let context = TestContext::new().await;
+    let endpoint = format!("/pallasync/v2/chains/{}/records", context.chain_id);
+    let token = context.capability_token("GET", &endpoint, b"");
+
+    // First request with token succeeds
+    let res1 = context
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&endpoint)
+                .header("Authorization", format!("PallaSync {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.status(), StatusCode::OK);
+
+    // Second request with identical token (reused nonce) is rejected with 401
+    let res2 = context
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&endpoint)
+                .header("Authorization", format!("PallaSync {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res2.status(), StatusCode::UNAUTHORIZED);
+    let body: Value = json_body(res2).await;
+    assert_eq!(body["code"], "invalid_token");
+    context.close().await;
+}
+
+#[tokio::test]
+async fn device_pagination_with_cursor_and_limit() {
+    let context = TestContext::new().await;
+    let endpoint = format!("/pallasync/v2/chains/{}/devices", context.chain_id);
+
+    // Enroll a second device
+    let second_key = SigningKey::from_bytes(&[9_u8; 32]);
+    let second_device_id = Uuid::from_u128(2).to_string();
+    let second_device = signed_device(
+        &context.chain_id,
+        &second_device_id,
+        200,
+        18,
+        &second_key,
+    );
+    assert_eq!(
+        context.send_enroll(&second_device).await.status(),
+        StatusCode::CREATED
+    );
+
+    // Fetch with limit=1
+    let page1_res = context.get(&format!("{endpoint}?limit=1")).await;
+    assert_eq!(page1_res.status(), StatusCode::OK);
+    let page1: GetDevicesResponse = json_body(page1_res).await;
+    assert_eq!(page1.devices.len(), 1);
+    assert_eq!(page1.devices[0].device_id, context.device_id);
+    assert!(page1.next_cursor.is_some());
+
+    // Fetch page 2 using cursor
+    let cursor = page1.next_cursor.unwrap();
+    let page2_res = context.get(&format!("{endpoint}?cursor={cursor}&limit=1")).await;
+    assert_eq!(page2_res.status(), StatusCode::OK);
+    let page2: GetDevicesResponse = json_body(page2_res).await;
+    assert_eq!(page2.devices.len(), 1);
+    assert_eq!(page2.devices[0].device_id, second_device_id);
+    assert!(page2.next_cursor.is_none());
+
+    context.close().await;
+}
+
+#[tokio::test]
+async fn revoke_device_with_capability_token_and_admin_proof() {
+    let context = TestContext::new().await;
+    let target_device_id = Uuid::from_u128(2).to_string();
+    let target_key = SigningKey::from_bytes(&[9_u8; 32]);
+    let target_device = signed_device(
+        &context.chain_id,
+        &target_device_id,
+        200,
+        18,
+        &target_key,
+    );
+    assert_eq!(
+        context.send_enroll(&target_device).await.status(),
+        StatusCode::CREATED
+    );
+
+    let revoke_uri = format!(
+        "/pallasync/v2/chains/{}/devices/{}/revoke",
+        context.chain_id, target_device_id
+    );
+    let admin_op = serde_json::json!({
+        "protocol_version": "2.1",
+        "chain_id": context.chain_id,
+        "operation": "revoke_device",
+        "target_device_id": target_device_id,
+        "created_at_ms": 300,
+    });
+    let admin_proof = admin_proof_for(&admin_op, &context.signing_key);
+    let revoke_req = serde_json::json!({
+        "protocol_version": "2.1",
+        "chain_id": context.chain_id,
+        "operation": "revoke_device",
+        "target_device_id": target_device_id,
+        "created_at_ms": 300,
+        "admin_proof": admin_proof,
+    });
+    let body_bytes = serde_json::to_vec(&revoke_req).unwrap();
+    let token = context.capability_token("POST", &revoke_uri, &body_bytes);
+
+    let response = context
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&revoke_uri)
+                .header(CONTENT_TYPE, "application/json")
+                .header("Authorization", format!("PallaSync {token}"))
+                .body(Body::from(body_bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Verify target device status is now revoked
+    let devices_res = context.get(&format!("/pallasync/v2/chains/{}/devices", context.chain_id)).await;
+    let devices_resp: GetDevicesResponse = json_body(devices_res).await;
+    let revoked = devices_resp.devices.iter().find(|d| d.device_id == target_device_id).unwrap();
+    assert_eq!(revoked.status, "revoked");
+
     context.close().await;
 }
 
@@ -629,6 +883,59 @@ fn signature_for<T: Serialize>(value: &T, signing_key: &SigningKey, context: &[u
     message.extend_from_slice(context);
     message.extend_from_slice(&canonical);
     URL_SAFE_NO_PAD.encode(signing_key.sign(&message).to_bytes())
+}
+
+fn admin_proof_for<T: Serialize>(value: &T, admin_key: &SigningKey) -> String {
+    let mut value = serde_json::to_value(value).unwrap();
+    value.as_object_mut().unwrap().remove("admin_proof");
+    let canonical = serde_jcs::to_vec(&value).unwrap();
+    let mut message = Vec::with_capacity(CTX_ADMIN_OP.len() + canonical.len());
+    message.extend_from_slice(CTX_ADMIN_OP);
+    message.extend_from_slice(&canonical);
+    URL_SAFE_NO_PAD.encode(admin_key.sign(&message).to_bytes())
+}
+
+fn signed_capability_token(
+    chain_id: &str,
+    device_id: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    signing_key: &SigningKey,
+) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let nonce_bytes = Uuid::new_v4();
+    let nonce = URL_SAFE_NO_PAD.encode(&nonce_bytes.as_bytes()[..16]);
+    let body_sha256 = URL_SAFE_NO_PAD.encode(Sha256::digest(body));
+
+    let mut token_val = serde_json::json!({
+        "v": 1,
+        "chain_id": chain_id,
+        "device_id": device_id,
+        "method": method.to_uppercase(),
+        "path": path,
+        "query": query,
+        "body_sha256": body_sha256,
+        "issued_at_ms": now_ms,
+        "expires_at_ms": now_ms + 300_000,
+        "nonce": nonce,
+    });
+
+    let canonical = serde_jcs::to_vec(&token_val).unwrap();
+    let mut message = Vec::with_capacity(CTX_CAPABILITY.len() + canonical.len());
+    message.extend_from_slice(CTX_CAPABILITY);
+    message.extend_from_slice(&canonical);
+
+    let signature = signing_key.sign(&message);
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
+    token_val["signature"] = serde_json::Value::String(signature_b64);
+
+    let final_bytes = serde_json::to_vec(&token_val).unwrap();
+    URL_SAFE_NO_PAD.encode(final_bytes)
 }
 
 async fn json_body<T: serde::de::DeserializeOwned>(response: Response<Body>) -> T {

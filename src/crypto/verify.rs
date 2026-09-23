@@ -45,10 +45,11 @@ pub fn verify_signed_json(
     context: &[u8],
 ) -> Result<bool, String> {
     let mut unsigned = value.clone();
-    unsigned
+    let obj = unsigned
         .as_object_mut()
-        .ok_or_else(|| "Signed value must be a JSON object".to_string())?
-        .remove("signature");
+        .ok_or_else(|| "Signed value must be a JSON object".to_string())?;
+    obj.remove("signature");
+    obj.remove("admin_proof");
     let canonical = canonicalize_json(&unsigned).map_err(|error| error.to_string())?;
 
     let mut message = Vec::with_capacity(context.len() + canonical.len());

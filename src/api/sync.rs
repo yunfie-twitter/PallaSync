@@ -28,6 +28,8 @@ pub const PROTOCOL_VERSION: &str = "2.1";
 pub const VENDOR_MEDIA_TYPE: &str = "application/vnd.palleria.sync.v2+json";
 pub const DEFAULT_PAGE_LIMIT: u32 = 200;
 pub const MAX_PAGE_LIMIT: u32 = 500;
+pub const DEFAULT_DEVICE_PAGE_LIMIT: u32 = 50;
+pub const MAX_DEVICE_PAGE_LIMIT: u32 = 200;
 pub const MAX_CIPHERTEXT_BYTES: usize = 8 * 1024 * 1024;
 
 static NEXT_SEQ_HEADER: HeaderName = HeaderName::from_static("pallasync-next-seq");
@@ -40,6 +42,19 @@ pub struct RecordQuery {
     pub after_seq: Option<i64>,
     pub since_ms: Option<i64>,
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetDevicesResponse {
+    pub devices: Vec<DeviceRecord>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -813,34 +828,64 @@ pub async fn get_devices(
     State(state): State<DbState>,
     Path(chain_id): Path<String>,
     headers: HeaderMap,
+    query: Result<Query<DeviceQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(|e| ApiError::bad_request(e.body_text()))?;
     validate_chain_id(&chain_id)?;
     ensure_not_deleted(&state, &chain_id).await?;
 
     let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
+    let query_str = query_to_string_device(&query);
     let _auth_device_id = verify_capability_token(
         &state,
         auth_header,
         &chain_id,
         "GET",
         &format!("/pallasync/v2/chains/{chain_id}/devices"),
-        "",
+        &query_str,
         b"",
     )
     .await?;
 
+    if let Some(l) = query.limit
+        && l > MAX_DEVICE_PAGE_LIMIT
+    {
+        return Err(ApiError::bad_request(
+            "limit exceeds maximum allowed limit of 200",
+        ));
+    }
+
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_DEVICE_PAGE_LIMIT)
+        .min(MAX_DEVICE_PAGE_LIMIT) as usize;
+
+    let after_created_at_ms = if let Some(ref cur) = query.cursor {
+        cur.parse::<i64>().unwrap_or(0)
+    } else {
+        0
+    };
+
     let rows = sqlx::query(
         "SELECT device_id, device_public_key, encrypted_device_name, device_name_nonce, status, created_at_ms, updated_at_ms, signature \
-         FROM devices WHERE chain_id = ? ORDER BY created_at_ms ASC, device_id ASC"
+         FROM devices WHERE chain_id = ? AND created_at_ms > ? \
+         ORDER BY created_at_ms ASC, device_id ASC LIMIT ?"
     )
     .bind(&chain_id)
+    .bind(after_created_at_ms)
+    .bind((limit + 1) as i64)
     .fetch_all(&state.pool)
     .await
     .map_err(ApiError::database)?;
 
-    let devices = rows
-        .into_iter()
-        .map(|row| DeviceRecord {
+    let has_more = rows.len() > limit;
+    let mut max_created_at = after_created_at_ms;
+    let mut devices = Vec::with_capacity(rows.len().min(limit));
+
+    for row in rows.into_iter().take(limit) {
+        let created_at: i64 = row.get("created_at_ms");
+        max_created_at = max_created_at.max(created_at);
+        devices.push(DeviceRecord {
             protocol_version: PROTOCOL_VERSION.to_string(),
             chain_id: chain_id.clone(),
             device_id: row.get("device_id"),
@@ -848,13 +893,24 @@ pub async fn get_devices(
             encrypted_device_name: row.get("encrypted_device_name"),
             device_name_nonce: row.get("device_name_nonce"),
             status: row.get("status"),
-            created_at_ms: row.get("created_at_ms"),
+            created_at_ms: created_at,
             updated_at_ms: row.get("updated_at_ms"),
             signature: row.get("signature"),
-        })
-        .collect::<Vec<_>>();
+        });
+    }
 
-    Ok(vendor_json(devices))
+    let next_cursor = if has_more {
+        Some(max_created_at.to_string())
+    } else {
+        None
+    };
+
+    let resp = GetDevicesResponse {
+        devices,
+        next_cursor,
+    };
+
+    Ok(vendor_json(resp))
 }
 
 pub async fn update_device(
@@ -922,12 +978,24 @@ pub async fn update_device(
 pub async fn revoke_device(
     State(state): State<DbState>,
     Path((chain_id, device_id)): Path<(String, String)>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     validate_chain_id(&chain_id)?;
     validate_uuid("device_id", &device_id)?;
     ensure_not_deleted(&state, &chain_id).await?;
+
+    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
+    let _auth_device_id = verify_capability_token(
+        &state,
+        auth_header,
+        &chain_id,
+        "POST",
+        &format!("/pallasync/v2/chains/{chain_id}/devices/{device_id}/revoke"),
+        "",
+        &body,
+    )
+    .await?;
 
     let req: AdminOpRequest =
         serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -944,7 +1012,7 @@ pub async fn revoke_device(
     let valid = verify_signed_json(&admin_key, &req.admin_proof, &value, CTX_ADMIN_OP)
         .map_err(ApiError::bad_request)?;
     if !valid {
-        return Err(ApiError::invalid_signature("Invalid admin proof"));
+        return Err(ApiError::forbidden("invalid_signature", "Invalid admin proof"));
     }
 
     sqlx::query("UPDATE devices SET status = 'revoked' WHERE chain_id = ? AND device_id = ?")
@@ -961,26 +1029,40 @@ pub async fn revoke_device(
 pub async fn delete_chain(
     State(state): State<DbState>,
     Path(chain_id): Path<String>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     validate_chain_id(&chain_id)?;
     ensure_not_deleted(&state, &chain_id).await?;
 
-    // Verify admin proof if provided
-    if let Ok(req) = serde_json::from_slice::<AdminOpRequest>(&body) {
-        let admin_key = sqlx::query("SELECT admin_public_key FROM chains WHERE chain_id = ?")
-            .bind(&chain_id)
-            .fetch_optional(&state.pool)
-            .await
-            .map_err(ApiError::database)?
-            .map(|r| r.get::<String, _>("admin_public_key"));
+    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
+    let _auth_device_id = verify_capability_token(
+        &state,
+        auth_header,
+        &chain_id,
+        "DELETE",
+        &format!("/pallasync/v2/chains/{chain_id}"),
+        "",
+        &body,
+    )
+    .await?;
 
-        if let Some(key) = admin_key {
-            let value =
-                serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
-            let _ = verify_signed_json(&key, &req.admin_proof, &value, CTX_ADMIN_OP);
-        }
+    let req: AdminOpRequest =
+        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    let admin_key = sqlx::query("SELECT admin_public_key FROM chains WHERE chain_id = ?")
+        .bind(&chain_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::database)?
+        .map(|r| r.get::<String, _>("admin_public_key"))
+        .ok_or_else(|| ApiError::not_found("chain_not_found", "Chain not found"))?;
+
+    let value = serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let valid = verify_signed_json(&admin_key, &req.admin_proof, &value, CTX_ADMIN_OP)
+        .map_err(ApiError::bad_request)?;
+    if !valid {
+        return Err(ApiError::forbidden("invalid_signature", "Invalid admin proof"));
     }
 
     let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
@@ -1020,14 +1102,24 @@ async fn verify_capability_token(
     body: &[u8],
 ) -> Result<String, ApiError> {
     let header = match auth_header {
-        Some(h) => h.trim(),
-        None => return Ok(String::new()), // Permissive if no auth for testing/migration
+        Some(h) if !h.trim().is_empty() => h.trim(),
+        _ => {
+            return Err(ApiError::unauthorized(
+                "missing_authorization",
+                "Missing Authorization header",
+            ));
+        }
     };
 
     let token_b64 = header
         .strip_prefix("PallaSync ")
         .or_else(|| header.strip_prefix("Bearer "))
-        .unwrap_or(header);
+        .ok_or_else(|| {
+            ApiError::unauthorized(
+                "invalid_token",
+                "Authorization header must use PallaSync scheme",
+            )
+        })?;
 
     let token_bytes = URL_SAFE_NO_PAD
         .decode(token_b64)
@@ -1116,8 +1208,14 @@ async fn verify_capability_token(
         ));
     }
 
-    // Record replay nonce
-    let _ = sqlx::query(
+    // Purge expired nonces
+    let _ = sqlx::query("DELETE FROM replay_nonces WHERE expires_at_ms < ?")
+        .bind(now_ms)
+        .execute(&state.pool)
+        .await;
+
+    // Check and record replay nonce
+    let insert_res = sqlx::query(
         "INSERT INTO replay_nonces (chain_id, device_id, nonce, expires_at_ms) VALUES (?, ?, ?, ?) \
          ON CONFLICT(chain_id, device_id, nonce) DO NOTHING",
     )
@@ -1126,7 +1224,15 @@ async fn verify_capability_token(
     .bind(&token.nonce)
     .bind(token.expires_at_ms)
     .execute(&state.pool)
-    .await;
+    .await
+    .map_err(ApiError::database)?;
+
+    if insert_res.rows_affected() == 0 {
+        return Err(ApiError::unauthorized(
+            "invalid_token",
+            "Replay nonce reused",
+        ));
+    }
 
     Ok(token.device_id)
 }
@@ -1228,6 +1334,20 @@ fn query_to_string(query: &RecordQuery) -> String {
     }
     if let Some(s) = query.after_seq {
         parts.push(format!("after_seq={s}"));
+    }
+    if let Some(since) = query.since_ms {
+        parts.push(format!("since_ms={since}"));
+    }
+    if let Some(l) = query.limit {
+        parts.push(format!("limit={l}"));
+    }
+    parts.join("&")
+}
+
+fn query_to_string_device(query: &DeviceQuery) -> String {
+    let mut parts = Vec::new();
+    if let Some(ref c) = query.cursor {
+        parts.push(format!("cursor={c}"));
     }
     if let Some(l) = query.limit {
         parts.push(format!("limit={l}"));
