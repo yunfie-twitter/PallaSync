@@ -12,7 +12,6 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
-use sha2::{Digest, Sha256};
 use pallasync_server::{
     api::sync::{
         DeviceRecord, FetchRecordsResponse, GetDevicesResponse, PostRecordsResponse, SyncRecord,
@@ -25,6 +24,7 @@ use pallasync_server::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteConnectOptions;
 use tower::ServiceExt;
 use tower_http::cors::CorsLayer;
@@ -90,15 +90,13 @@ impl TestContext {
             signing_key,
         };
         let response = context
-            .send_enroll(
-                &signed_device(
-                    &context.chain_id,
-                    &context.device_id,
-                    100,
-                    17,
-                    &context.signing_key,
-                ),
-            )
+            .send_enroll(&signed_device(
+                &context.chain_id,
+                &context.device_id,
+                100,
+                17,
+                &context.signing_key,
+            ))
             .await;
         assert_eq!(response.status(), StatusCode::CREATED);
         context
@@ -684,13 +682,7 @@ async fn device_pagination_with_cursor_and_limit() {
     // Enroll a second device
     let second_key = SigningKey::from_bytes(&[9_u8; 32]);
     let second_device_id = Uuid::from_u128(2).to_string();
-    let second_device = signed_device(
-        &context.chain_id,
-        &second_device_id,
-        200,
-        18,
-        &second_key,
-    );
+    let second_device = signed_device(&context.chain_id, &second_device_id, 200, 18, &second_key);
     assert_eq!(
         context.send_enroll(&second_device).await.status(),
         StatusCode::CREATED
@@ -706,7 +698,9 @@ async fn device_pagination_with_cursor_and_limit() {
 
     // Fetch page 2 using cursor
     let cursor = page1.next_cursor.unwrap();
-    let page2_res = context.get(&format!("{endpoint}?cursor={cursor}&limit=1")).await;
+    let page2_res = context
+        .get(&format!("{endpoint}?cursor={cursor}&limit=1"))
+        .await;
     assert_eq!(page2_res.status(), StatusCode::OK);
     let page2: GetDevicesResponse = json_body(page2_res).await;
     assert_eq!(page2.devices.len(), 1);
@@ -721,13 +715,7 @@ async fn revoke_device_with_capability_token_and_admin_proof() {
     let context = TestContext::new().await;
     let target_device_id = Uuid::from_u128(2).to_string();
     let target_key = SigningKey::from_bytes(&[9_u8; 32]);
-    let target_device = signed_device(
-        &context.chain_id,
-        &target_device_id,
-        200,
-        18,
-        &target_key,
-    );
+    let target_device = signed_device(&context.chain_id, &target_device_id, 200, 18, &target_key);
     assert_eq!(
         context.send_enroll(&target_device).await.status(),
         StatusCode::CREATED
@@ -773,9 +761,18 @@ async fn revoke_device_with_capability_token_and_admin_proof() {
     assert_eq!(response.status(), StatusCode::OK);
 
     // Verify target device status is now revoked
-    let devices_res = context.get(&format!("/pallasync/v2/chains/{}/devices", context.chain_id)).await;
+    let devices_res = context
+        .get(&format!(
+            "/pallasync/v2/chains/{}/devices",
+            context.chain_id
+        ))
+        .await;
     let devices_resp: GetDevicesResponse = json_body(devices_res).await;
-    let revoked = devices_resp.devices.iter().find(|d| d.device_id == target_device_id).unwrap();
+    let revoked = devices_resp
+        .devices
+        .iter()
+        .find(|d| d.device_id == target_device_id)
+        .unwrap();
     assert_eq!(revoked.status, "revoked");
 
     context.close().await;

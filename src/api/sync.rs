@@ -1012,7 +1012,10 @@ pub async fn revoke_device(
     let valid = verify_signed_json(&admin_key, &req.admin_proof, &value, CTX_ADMIN_OP)
         .map_err(ApiError::bad_request)?;
     if !valid {
-        return Err(ApiError::forbidden("invalid_signature", "Invalid admin proof"));
+        return Err(ApiError::forbidden(
+            "invalid_signature",
+            "Invalid admin proof",
+        ));
     }
 
     sqlx::query("UPDATE devices SET status = 'revoked' WHERE chain_id = ? AND device_id = ?")
@@ -1062,7 +1065,10 @@ pub async fn delete_chain(
     let valid = verify_signed_json(&admin_key, &req.admin_proof, &value, CTX_ADMIN_OP)
         .map_err(ApiError::bad_request)?;
     if !valid {
-        return Err(ApiError::forbidden("invalid_signature", "Invalid admin proof"));
+        return Err(ApiError::forbidden(
+            "invalid_signature",
+            "Invalid admin proof",
+        ));
     }
 
     let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
