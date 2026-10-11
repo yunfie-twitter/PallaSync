@@ -21,6 +21,7 @@
 | export/import/re-seed | §10.3、§10.14、§17.4–§17.6 | bounded JCS JSONL、dual pinned cuts、D exportのrecovery omission、source signed DAG、staging、generation+1/global epoch+1、fresh pending subjects、old members retirement、coverage 0 snapshot。target receiptsをsourceのreceiptと偽らない。 |
 | authenticated deletionとanti-resurrection | §7.10、§7.12.3、§10.15、§17.7、§17.11 | `deletion.rs`。admin/policy-permitted D、CAS、exact target hash、ledger recurrence、original202 retry、authorized post-deletion proof、active erasure/WAL checkpoint後のcompletion。private metadataをauthority proofへ残さない。 |
 | 独立relay鍵・署名済みoperator disclosure・lower limits | §7.13、§17.8–§17.12 | `config.rs`。正確な同梱schema、semantic/URL/binary/Markdown hash/signature/revision/quota/tierの検査。実値未設定では起動拒否。rate bucketのIP digest/時刻を運用メタデータとして開示し、WAL/staging/cacheの実在を検査。暗号処理はrelay attestationだけで、client E2EE/root鍵を保持しない。 |
+| コマンド式Dockerセットアップと既定privacyひな形 | §7.13、§17.1、§17.8–§17.12 | `setup-docker.sh`、`docker_config.py`、`pallasync-operator`、`deploy/privacy.*.in`。運用固有値を入力し、既存のJCS/Ed25519と同一validatorで署名。age保護鍵をtmpfsから稼働環境へ注入し、既存鍵・公開版・永続ストアを再利用。匿名HTTPS文書とhealthを照合。追加HTTP APIやclient暗号処理なし。 |
 | shutdown/migration noticeとwrite freeze | §10.14、§17.6、§7.12.2 | 既存notice型を公表しexact valueをmigrate transparency entryへ結ぶ。configured originは候補のみ。redirect、Authorization forwarding、federation、automatic chain deletionを追加しない。freezeは503で、読取りとexportを保全。 |
 
 ## 依頼者が確認した解釈

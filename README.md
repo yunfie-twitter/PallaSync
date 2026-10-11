@@ -6,6 +6,12 @@ Rust/Axum + SQLiteで実装したblind relayです。唯一の仕様は [PALLASY
 
 ## 起動
 
+Linux/Dockerで鍵保護・既定privacy文書の入力/署名・HTTPS起動までコマンドで行う場合は、[セットアップ手順](docs/docker-setup.md)を参照してください。
+
+```sh
+bash scripts/setup-docker.sh setup --origin https://api.yunfi.f5.si --cloudflare
+```
+
 ```sh
 cargo build --locked --release
 cargo run --locked --release

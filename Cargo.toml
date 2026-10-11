@@ -2,6 +2,7 @@
 name = "pallasync-server"
 version = "3.0.0"
 edition = "2024"
+default-run = "pallasync-server"
 
 [dependencies]
 axum = "0.7"
