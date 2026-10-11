@@ -33,3 +33,26 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-features --verbose
+
+      - name: Verify deployment document generation and signing
+        run: |
+          cargo build --locked --bin pallasync-operator
+          python3 tests/test_docker_setup.py
+          bash -n scripts/setup-docker.sh
+          sh -n docker/entrypoint.sh
+
+  docker-setup:
+    name: Docker deployment smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Disable swap on the isolated test runner
+        run: sudo swapoff --all
+
+      - name: Build deployment image
+        run: docker build --tag pallasync-server:local .
+
+      - name: Verify tmpfs key injection and persistent restart
+        run: bash tests/docker_smoke.sh

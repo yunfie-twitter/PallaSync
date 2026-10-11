@@ -1,0 +1,76 @@
+{
+  "type": "PALLASYNC-RELAY-PRIVACY-v3",
+  "version": "3.0",
+  "relay_origin": "__ORIGIN__",
+  "operator": {"name": "__OPERATOR__", "contact_url": "__CONTACT__"},
+  "durability_tier": "single-durable",
+  "limits": {"max_request_bytes": 8388608, "max_records_per_upload": 64, "page_limit": 1000, "max_devices": 128},
+  "quota": {
+    "minimum_bytes": "__QUOTA_MIN__",
+    "maximum_bytes": "__QUOTA_MAX__",
+    "allow_unconfigured": "__QUOTA_UNCONFIGURED__",
+    "counted_components": ["record", "snapshot", "envelope", "device_meta", "receipt", "transparency", "control"],
+    "allocation_rule": "__QUOTA_RULE__"
+  },
+  "rate_limits": {
+    "authorized_signer": {"requests_per_minute": 120, "burst": 30},
+    "record_upload_device": {"requests_per_minute": 30, "burst": 10},
+    "enrollment_source_ip": {"requests_per_minute": 6, "burst": 3},
+    "enrollment_offer": {"requests_per_minute": 3, "burst": 1},
+    "public_document_ip": {"requests_per_minute": 240, "burst": 60}
+  },
+  "backups": {"enabled": false},
+  "copies": {
+    "active_store": {
+      "present": true, "content": "ciphertext", "retention": {"mode": "until_chain_deletion"},
+      "locations": ["__LOCATION__"], "recipients": ["__RECIPIENTS__"], "purpose": "Accepted encrypted objects and signed protocol state",
+      "after_delete": {"mode": "erase", "max_ms": "__DELETE_MS__"}
+    },
+    "replica": {"present": false},
+    "wal": {
+      "present": true, "content": "ciphertext", "retention": {"mode": "until_chain_deletion"},
+      "locations": ["__LOCATION__"], "recipients": ["__RECIPIENTS__"], "purpose": "SQLite transaction durability; WAL is checkpointed during operation",
+      "after_delete": {"mode": "erase", "max_ms": "__DELETE_MS__"}
+    },
+    "snapshot_store": {
+      "present": true, "content": "ciphertext", "retention": {"mode": "until_chain_deletion"},
+      "locations": ["__LOCATION__"], "recipients": ["__RECIPIENTS__"], "purpose": "Encrypted snapshots subject to authenticated compaction and retention rules",
+      "after_delete": {"mode": "erase", "max_ms": "__DELETE_MS__"}
+    },
+    "backup": {"present": false},
+    "staging": {
+      "present": true, "content": "ciphertext", "retention": {"mode": "until_chain_deletion"},
+      "locations": ["__LOCATION__"], "recipients": ["__RECIPIENTS__"], "purpose": "Import and snapshot staging until publication, protocol cleanup, or chain deletion",
+      "after_delete": {"mode": "erase", "max_ms": "__DELETE_MS__"}
+    },
+    "temporary_export": {"present": false},
+    "support": {"present": false},
+    "cache": {
+      "present": true, "content": "metadata", "retention": {"mode": "indefinite"},
+      "locations": ["__LOCATION__"], "recipients": ["__RECIPIENTS__"], "purpose": "Persistent rate buckets using immediate upstream IP hashes and update timestamps",
+      "after_delete": {"mode": "retain_metadata", "max_ms": null}
+    },
+    "operational_log": {"present": false},
+    "attestations": {
+      "present": true, "content": "authority_evidence", "retention": {"mode": "indefinite"},
+      "locations": ["__LOCATION__"], "recipients": ["__RECIPIENTS__"], "purpose": "Signed receipts, object hashes, public transparency links and heads",
+      "after_delete": {"mode": "retain_authority_evidence", "max_ms": null}
+    },
+    "deletion_ledger": {
+      "present": true, "content": "authority_evidence", "retention": {"mode": "indefinite"},
+      "locations": ["__LOCATION__"], "recipients": ["__RECIPIENTS__"], "purpose": "Minimal signed deletion authorization and anti-resurrection proof",
+      "after_delete": {"mode": "retain_authority_evidence", "max_ms": null}
+    }
+  },
+  "deletion": {"assurance": "backup-expiry", "active_delete_max_ms": "__DELETE_MS__", "backup_delete_max_ms": null, "key_destroy_max_ms": null},
+  "relay_key": {
+    "protection": "passphrase_wrapped", "replacement_mode": "explicit_trust_reestablishment",
+    "automatic_rotation": false, "new_transparency_id_required": true, "old_verification_keys_retained": true
+  },
+  "replay_protection": {"mode": "durable"},
+  "metadata": {
+    "retained_fields": ["ip", "timing"], "purposes": ["Persistent rate limiting with source IP digests and last update times"],
+    "retention": {"mode": "indefinite"}, "recipients": ["__RECIPIENTS__"]
+  },
+  "change_notice": {"minimum_notice_ms": "__NOTICE_MS__", "notice_url": "__NOTICE__", "archive_url": "__ARCHIVE__"}
+}

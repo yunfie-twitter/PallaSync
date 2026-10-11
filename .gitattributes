@@ -2,3 +2,7 @@
 docs/v3.0.md -text -whitespace
 docs/privacy.md -text -whitespace
 docs/privacy.schema.json -text -whitespace
+*.sh text eol=lf
+deploy/*.in text eol=lf
+operator/**/privacy.md -text -whitespace
+operator/**/privacy.json -text

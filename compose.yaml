@@ -9,7 +9,7 @@ services:
     environment:
       PALLASYNC_BIND_ADDR: "0.0.0.0:3000"
       DATABASE_URL: sqlite:///data/pallasync.sqlite
-      PALLASYNC_RELAY_SIGNING_SEED: "${PALLASYNC_RELAY_SIGNING_SEED:?Inject the protected operator key}"
+      PALLASYNC_RELAY_SIGNING_SEED: "${PALLASYNC_RELAY_SIGNING_SEED:-}"
       PALLASYNC_PRIVACY_MARKDOWN: /policy/privacy.md
       PALLASYNC_PRIVACY_JSON: /policy/privacy.json
     ports:
