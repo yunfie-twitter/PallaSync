@@ -96,7 +96,7 @@ if [[ $action == setup ]]; then
     [[ $cloudflare == no ]] || config_args+=(--cloudflare)
     python3 "$repo/scripts/docker_config.py" "${config_args[@]}"
     echo 'Building server and offline policy signer...'
-    docker build --tag pallasync-server:local "$repo"
+    docker build --progress plain --tag pallasync-server:local "$repo"
 else
     [[ -f $state_dir/deployment.json && -f $state_dir/policy/privacy.json ]] || fail 'Run setup first'
     docker image inspect pallasync-server:local >/dev/null
@@ -195,10 +195,10 @@ done
 checks=$(mktemp -d)
 curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:$host_port/pallasync/v3/health" > "$checks/local-health.json"
 echo "Checking public HTTPS, key pin and privacy documents at $origin..."
-curl --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors --connect-timeout 5 --max-time 10 \
+curl --tlsv1.2 --fail --silent --show-error --retry 12 --retry-delay 5 --retry-all-errors --connect-timeout 5 --max-time 10 \
     "$origin/pallasync/v3/health" > "$checks/health.json"
-curl --fail --silent --show-error --max-time 15 "$origin/privacy.md" > "$checks/privacy.md"
-curl --fail --silent --show-error --max-time 15 "$origin/privacy.json" > "$checks/privacy.json"
+curl --tlsv1.2 --fail --silent --show-error --max-time 15 "$origin/privacy.md" > "$checks/privacy.md"
+curl --tlsv1.2 --fail --silent --show-error --max-time 15 "$origin/privacy.json" > "$checks/privacy.json"
 python3 - "$state_dir/policy" "$checks" "$origin" <<'PY'
 import json, sys
 from pathlib import Path

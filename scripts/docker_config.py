@@ -201,7 +201,7 @@ def main():
             raise ValueError("既存deploymentのoriginを変更できません")
         if p["project"] != args.project:
             raise ValueError("既存deploymentのCompose projectを変更できません")
-        print("既存の運用設定と署名済み文書を再利用します")
+        print("既存の運用設定を再利用し、文書の署名を確認します")
         return
     if not 1 <= args.host_port <= 65535:
         raise ValueError("host portは1〜65535です")
