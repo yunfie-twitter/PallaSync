@@ -23,6 +23,7 @@
 | 独立relay鍵・署名済みoperator disclosure・lower limits | §7.13、§17.8–§17.12 | `config.rs`。正確な同梱schema、semantic/URL/binary/Markdown hash/signature/revision/quota/tierの検査。実値未設定では起動拒否。rate bucketのIP digest/時刻を運用メタデータとして開示し、WAL/staging/cacheの実在を検査。暗号処理はrelay attestationだけで、client E2EE/root鍵を保持しない。 |
 | コマンド式Dockerセットアップと既定privacyひな形 | §7.13、§17.1、§17.8–§17.12 | `setup-docker.sh`、`docker_config.py`、`pallasync-operator`、`deploy/privacy.*.in`。運用固有値を入力し、既存のJCS/Ed25519と同一validatorで署名。age保護鍵をtmpfsから稼働環境へ注入し、既存鍵・公開版・永続ストアを再利用。匿名HTTPS文書とhealthを照合。追加HTTP APIやclient暗号処理なし。 |
 | 公開operator文書の保存と署名検証 | §7.13、§17.9、§17.12 | `operator/api.yunfi.f5.si`、`tests/operator_policy.rs`。実際の公開版を厳密なbytesで保存し、公開検証鍵とv3 contextで検証。デプロイのTLS条件に関する残事項は同directoryのREADMEに記載。 |
+| Palleria native生成objectとの接続回帰検証 | §3.4、§4.1、§6、§10.2、§10.5–§10.6 | `tests/fixtures/palleria-v3-genesis.json`、`tests/v3_integration.rs`。公開KDF-01 mnemonicのテスト用genesis/recordを受理し、v2 mediaとUUIDv7を拒否。200の部分拒否でも受理objectのreceiptを維持。fixtureのseedは公開テスト鍵であり、実ユーザー・relayの鍵ではない。 |
 | shutdown/migration noticeとwrite freeze | §10.14、§17.6、§7.12.2 | 既存notice型を公表しexact valueをmigrate transparency entryへ結ぶ。configured originは候補のみ。redirect、Authorization forwarding、federation、automatic chain deletionを追加しない。freezeは503で、読取りとexportを保全。 |
 
 ## 依頼者が確認した解釈
