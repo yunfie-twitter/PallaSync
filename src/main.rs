@@ -1,45 +1,39 @@
-use axum::http::{HeaderName, HeaderValue};
-use dotenvy::dotenv;
-use pallasync_server::{app, db};
-use std::env;
-use std::net::SocketAddr;
-use tower_http::cors::{Any, CorsLayer};
-
+use pallasync_server::{api::sync::AppState, app, config::RelayConfig, db};
+use std::{env, net::SocketAddr};
 #[tokio::main]
-async fn main() {
-    dotenv().ok();
-
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // No HTTP tracing: token/query/chain/IP data must never enter relay logs (§6.3/§17.10).
     tracing_subscriber::fmt::init();
-
-    let db_state = db::init_db().await.expect("Failed to initialize database");
-    tracing::info!(database_path = %db_state.resolved_path, "Using PallaSync database");
-
-    let allowed_url = env::var("URL").unwrap_or_else(|_| "*".to_string());
-
-    let cors = (if allowed_url == "*" {
-        CorsLayer::permissive()
-    } else {
-        CorsLayer::new()
-            .allow_origin(
-                allowed_url
-                    .parse::<HeaderValue>()
-                    .expect("Invalid URL format for CORS origin"),
-            )
-            .allow_methods(Any)
-            .allow_headers(Any)
-    })
-    .expose_headers([
-        HeaderName::from_static("pallasync-next-seq"),
-        HeaderName::from_static("pallasync-has-more"),
-    ]);
-
-    let port = env::var("PORT")
-        .unwrap_or_else(|_| "3000".to_string())
-        .parse::<u16>()
-        .expect("PORT must be an integer between 0 and 65535");
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!("Server listening on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app(db_state, cors)).await.unwrap();
+    let config = RelayConfig::from_env().map_err(std::io::Error::other)?;
+    let db = db::init_db().await?;
+    if db.resolved_path == ":memory:" {
+        return Err("Public use requires persistent storage (§17.1)".into());
+    }
+    let state = AppState::new(db, config)
+        .await
+        .map_err(|e| std::io::Error::other(e.code))?;
+    let maintenance = state.clone();
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            timer.tick().await;
+            let _ = pallasync_server::api::deletion::complete(&maintenance.db, &maintenance.config)
+                .await;
+            let _ =
+                pallasync_server::api::retention::maintenance(&maintenance.db, &maintenance.config)
+                    .await;
+        }
+    });
+    // The upstream TLS terminator is the only public entry point (§17.1).
+    let bind = env::var("PALLASYNC_BIND_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:3000".into())
+        .parse::<SocketAddr>()?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!("PallaSync pallasync/3 relay ready behind configured HTTPS origin");
+    axum::serve(
+        listener,
+        app(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
 }

@@ -7,13 +7,16 @@ services:
     restart: unless-stopped
     init: true
     environment:
-      PORT: "3000"
+      PALLASYNC_BIND_ADDR: "0.0.0.0:3000"
       DATABASE_URL: sqlite:///data/pallasync.sqlite
-      URL: "${PALLASYNC_CORS_ORIGIN:-*}"
+      PALLASYNC_RELAY_SIGNING_SEED: "${PALLASYNC_RELAY_SIGNING_SEED:?Inject the protected operator key}"
+      PALLASYNC_PRIVACY_MARKDOWN: /policy/privacy.md
+      PALLASYNC_PRIVACY_JSON: /policy/privacy.json
     ports:
-      - "${PALLASYNC_HOST_PORT:-3000}:3000"
+      - "127.0.0.1:${PALLASYNC_HOST_PORT:-3000}:3000"
     volumes:
       - pallasync-data:/data
+      - "${PALLASYNC_OPERATOR_DIR:?Set the populated operator policy directory}:/policy:ro"
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777

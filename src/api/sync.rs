@@ -1,1391 +1,824 @@
-use std::collections::HashMap;
-
-use axum::{
-    Json,
-    body::Bytes,
-    extract::{
-        Path, Query, State,
-        rejection::{JsonRejection, QueryRejection},
-    },
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header::CONTENT_TYPE},
-    response::{IntoResponse, Response},
+//! Exhaustive §10 endpoint catalogue. Raw method/path/query/body reach token validation unchanged.
+use super::{
+    auth::{self, Auth},
+    batch, deletion,
+    error::*,
+    export, import, mutation, read,
+    store::{self, Chain},
+    wire::*,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use sqlx::Row;
-use tracing::{error, info, warn};
-use uuid::Uuid;
-
 use crate::{
-    crypto::verify::{
-        CTX_ADMIN_OP, CTX_CAPABILITY, CTX_DEVICE_RECORD, CTX_SYNC_RECORD, verify_signed_json,
-    },
+    config::RelayConfig,
+    crypto::{jcs, verify::*},
     db::DbState,
 };
-
-pub const PROTOCOL_VERSION: &str = "2.1";
-pub const VENDOR_MEDIA_TYPE: &str = "application/vnd.palleria.sync.v2+json";
-pub const DEFAULT_PAGE_LIMIT: u32 = 200;
-pub const MAX_PAGE_LIMIT: u32 = 500;
-pub const DEFAULT_DEVICE_PAGE_LIMIT: u32 = 50;
-pub const MAX_DEVICE_PAGE_LIMIT: u32 = 200;
-pub const MAX_CIPHERTEXT_BYTES: usize = 8 * 1024 * 1024;
-
-static NEXT_SEQ_HEADER: HeaderName = HeaderName::from_static("pallasync-next-seq");
-static HAS_MORE_HEADER: HeaderName = HeaderName::from_static("pallasync-has-more");
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordQuery {
-    pub cursor: Option<String>,
-    pub after_seq: Option<i64>,
-    pub since_ms: Option<i64>,
-    pub limit: Option<u32>,
+use axum::{
+    body::{Body, to_bytes},
+    extract::{ConnectInfo, State},
+    http::{Request, Response, StatusCode, header},
+    response::IntoResponse,
+};
+use serde_json::{Value, json};
+use sqlx::Row;
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use tokio::sync::{Mutex, Semaphore};
+pub const VENDOR_MEDIA_TYPE: &str = "application/vnd.palleria.sync.v3+json";
+pub const EXPORT_MEDIA_TYPE: &str = "application/vnd.palleria.sync.export.v3+jsonl";
+#[derive(Clone)]
+pub struct AppState {
+    pub db: DbState,
+    pub config: Arc<RelayConfig>,
+    pub transfers: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
 }
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeviceQuery {
-    pub cursor: Option<String>,
-    pub limit: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetDevicesResponse {
-    pub devices: Vec<DeviceRecord>,
-    pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CapabilityToken {
-    pub v: u32,
-    pub chain_id: String,
-    pub device_id: String,
-    pub method: String,
-    pub path: String,
-    #[serde(default)]
-    pub query: String,
-    pub body_sha256: String,
-    pub issued_at_ms: i64,
-    pub expires_at_ms: i64,
-    pub nonce: String,
-    #[serde(default)]
-    pub signature: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ChainParameters {
-    pub protocol_version: String,
-    pub chain_id: String,
-    pub chain_salt: String,
-    pub created_at_ms: i64,
-    pub creator_device_id: String,
-    pub creator_public_key: String,
-    pub admin_public_key: String,
-    #[serde(default)]
-    pub signature: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct EnrollmentRequest {
-    pub protocol_version: String,
-    pub chain_id: String,
-    pub device_id: String,
-    pub device_public_key: String,
-    pub encrypted_device_name: String,
-    #[serde(default)]
-    pub device_name_nonce: String,
-    pub created_at_ms: i64,
-    #[serde(default)]
-    pub enrollment_proof: String,
-    #[serde(default)]
-    pub invitation_id: Option<String>,
-    #[serde(default)]
-    pub signature: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DeviceRecord {
-    pub protocol_version: String,
-    pub chain_id: String,
-    pub device_id: String,
-    pub device_public_key: String,
-    pub encrypted_device_name: String,
-    #[serde(default)]
-    pub device_name_nonce: String,
-    #[serde(default = "default_status_active")]
-    pub status: String,
-    pub created_at_ms: i64,
-    #[serde(default)]
-    pub updated_at_ms: i64,
-    #[serde(default)]
-    pub signature: String,
-}
-
-fn default_status_active() -> String {
-    "active".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SyncRecord {
-    pub protocol_version: String,
-    pub chain_id: String,
-    pub record_id: String,
-    #[serde(default)]
-    pub epoch: i64,
-    pub collection_name: String,
-    pub action: String,
-    pub encrypted_payload: String,
-    #[serde(default)]
-    pub payload_nonce: String,
-    pub device_id: String,
-    #[serde(default)]
-    pub lamport: i64,
-    pub created_at_ms: i64,
-    #[serde(default)]
-    pub signature: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PostRecordsBody {
-    #[serde(default)]
-    pub records: Vec<SyncRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostRecordsResponse {
-    pub accepted_record_ids: Vec<String>,
-    pub duplicate_record_ids: Vec<String>,
-    pub rejected: Vec<RejectedRecord>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RejectedRecord {
-    pub record_id: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FetchRecordsResponse {
-    pub records: Vec<SyncRecord>,
-    pub next_cursor: Option<String>,
-    pub server_time_ms: i64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AdminOpRequest {
-    pub protocol_version: String,
-    pub chain_id: String,
-    pub operation: String,
-    pub target_device_id: Option<String>,
-    pub created_at_ms: i64,
-    pub admin_proof: String,
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    protocol_version: &'static str,
-}
-
-#[derive(Debug)]
-pub struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    title: &'static str,
-    detail: String,
-}
-
-#[derive(Serialize)]
-pub struct ApiErrorBody {
-    #[serde(rename = "type")]
-    pub error_type: String,
-    pub title: &'static str,
-    pub status: u16,
-    pub code: &'static str,
-    pub detail: String,
-    pub request_id: String,
-}
-
-impl ApiError {
-    pub fn bad_request(detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code: "invalid_request",
-            title: "Invalid Request",
-            detail: detail.into(),
+impl AppState {
+    pub async fn new(db: DbState, config: RelayConfig) -> Result<Self> {
+        if db.resolved_path == ":memory:" { /* Only test callers use in-memory storage; main refuses it. */
         }
-    }
-
-    pub fn unauthorized(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            code,
-            title: "Unauthorized",
-            detail: detail.into(),
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if config.privacy["replay_protection"]["mode"] == "restart_barrier" {
+            sqlx::query("INSERT INTO v3_restart_barrier(id,barrier_ms) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET barrier_ms=MAX(barrier_ms,excluded.barrier_ms)").bind((now()+60000) as i64).execute(&mut *tx).await?;
         }
-    }
-
-    pub fn forbidden(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            code,
-            title: "Forbidden",
-            detail: detail.into(),
+        if let Some(row) = sqlx::query(
+            "SELECT origin,relay_key_id,revision,disclosure_hash FROM v3_operator WHERE id=1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+            && (row.get::<String, _>("origin") != config.origin
+                || row.get::<String, _>("relay_key_id") != config.key_id
+                || row.get::<i64, _>("revision") as u64 > n(&config.privacy, "revision")
+                || (row.get::<i64, _>("revision") as u64 == n(&config.privacy, "revision")
+                    && row.get::<String, _>("disclosure_hash") != object_hash(&config.privacy)))
+        {
+            return Err(err("INVALID_FIELD"));
         }
-    }
-
-    pub fn not_found(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            code,
-            title: "Not Found",
-            detail: detail.into(),
+        sqlx::query("INSERT INTO v3_operator(id,origin,relay_key_id,revision,disclosure_hash) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,disclosure_hash=excluded.disclosure_hash").bind(&config.origin).bind(&config.key_id).bind(n(&config.privacy,"revision") as i64).bind(object_hash(&config.privacy)).execute(&mut *tx).await?;
+        tx.commit().await?;
+        deletion::complete(&db, &config).await?;
+        let mut tx = db.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let ids:Vec<String>=sqlx::query_scalar("SELECT chain_id FROM v3_chains WHERE chain_id NOT IN (SELECT chain_id FROM v3_deletions)").fetch_all(&mut *tx).await?;
+        for id in ids {
+            if let Some(mut c) = store::load(&mut tx, &id).await? {
+                store::publish_notice(&mut tx, &mut c, &config).await?;
+                store::save(&mut tx, &c, &config).await?;
+            }
         }
-    }
-
-    pub fn conflict(code: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            code,
-            title: "Conflict",
-            detail: detail.into(),
-        }
-    }
-
-    pub fn invalid_signature(detail: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            code: "invalid_signature",
-            title: "Invalid Signature",
-            detail: detail.into(),
-        }
-    }
-
-    pub fn gone() -> Self {
-        Self {
-            status: StatusCode::GONE,
-            code: "chain_deleted",
-            title: "Chain Deleted",
-            detail: "This chain has been permanently deleted".to_string(),
-        }
-    }
-
-    pub fn database(error: sqlx::Error) -> Self {
-        error!(%error, "database operation failed");
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "database_error",
-            title: "Internal Database Error",
-            detail: "Database operation failed".to_string(),
-        }
+        tx.commit().await?;
+        Ok(Self {
+            db,
+            config: Arc::new(config),
+            transfers: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 }
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let request_id = Uuid::new_v4().to_string();
-        let error_body = ApiErrorBody {
-            error_type: format!("https://pallasync.org/errors/{}", self.code),
-            title: self.title,
-            status: self.status.as_u16(),
-            code: self.code,
-            detail: self.detail,
-            request_id,
-        };
-        let mut response = (self.status, Json(error_body)).into_response();
-        set_vendor_content_type(&mut response);
-        response
-    }
+struct Endpoint {
+    route: &'static str,
+    chain: String,
+    param: String,
+    allow: &'static str,
 }
-
-pub async fn health(State(state): State<DbState>) -> Result<Response, ApiError> {
-    sqlx::query("SELECT 1")
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::database)?;
-    Ok(vendor_json(HealthResponse {
-        status: "ok",
-        protocol_version: PROTOCOL_VERSION,
-    }))
-}
-
-pub async fn get_chain_parameters(
-    State(state): State<DbState>,
-    Path(chain_id): Path<String>,
-) -> Result<Response, ApiError> {
-    validate_chain_id(&chain_id)?;
-    ensure_not_deleted(&state, &chain_id).await?;
-
-    let row = sqlx::query(
-        "SELECT chain_id, chain_salt, admin_public_key, created_at_ms, creator_device_id, creator_public_key, deleted_at_ms \
-         FROM chains WHERE chain_id = ?"
-    )
-    .bind(&chain_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::database)?
-    .ok_or_else(|| ApiError::not_found("chain_not_found", "Chain not found"))?;
-
-    let params = ChainParameters {
-        protocol_version: PROTOCOL_VERSION.to_string(),
-        chain_id: row.get("chain_id"),
-        chain_salt: row.get("chain_salt"),
-        created_at_ms: row.get("created_at_ms"),
-        creator_device_id: row.get("creator_device_id"),
-        creator_public_key: row.get("creator_public_key"),
-        admin_public_key: row.get("admin_public_key"),
-        signature: String::new(),
+fn endpoint(path: &str, method: &str) -> Result<Endpoint> {
+    let parts: Vec<_> = path
+        .strip_prefix("/pallasync/v3/")
+        .ok_or_else(|| err("ENDPOINT_NOT_FOUND"))?
+        .split('/')
+        .collect();
+    let (route, chain, param, allow) = match parts.as_slice() {
+        ["health"] => ("health", "", "", "GET"),
+        ["chains"] => ("genesis", "", "", "POST"),
+        ["chains", "import"] => ("import", "", "", "POST"),
+        ["chains", c] => ("delete", *c, "", "DELETE"),
+        ["chains", c, "parameters"] => (
+            if method == "PUT" {
+                "reseed"
+            } else {
+                "parameters_get"
+            },
+            *c,
+            "",
+            "GET, PUT",
+        ),
+        ["chains", c, "devices", "enroll"] => ("enroll", *c, "", "POST"),
+        ["chains", c, "devices"] => ("devices", *c, "", "GET"),
+        ["chains", c, "devices", d, "revoke"] => ("revoke", *c, *d, "POST"),
+        ["chains", c, "devices", d, "envelopes"] => ("own_envelopes", *c, *d, "GET"),
+        ["chains", c, "devices", d, "keys", "ack"] => ("ack", *c, *d, "POST"),
+        ["chains", c, "records"] => (
+            if method == "POST" {
+                "records_post"
+            } else {
+                "records_get"
+            },
+            *c,
+            "",
+            "GET, POST",
+        ),
+        ["chains", c, "records", "repair"] => ("repair", *c, "", "POST"),
+        ["chains", c, "enrollment-offers"] => ("offer", *c, "", "POST"),
+        ["chains", c, "enrollment-requests"] => (
+            if method == "POST" {
+                "request"
+            } else {
+                "requests_get"
+            },
+            *c,
+            "",
+            "GET, POST",
+        ),
+        ["chains", c, "enrollment-requests", id, "approve"] => ("approve", *c, *id, "POST"),
+        ["chains", c, "enrollment-requests", id, "reject"] => ("reject", *c, *id, "POST"),
+        ["chains", c, "epochs"] => (
+            if method == "POST" {
+                "epochs_post"
+            } else {
+                "epochs_get"
+            },
+            *c,
+            "",
+            "GET, POST",
+        ),
+        ["chains", c, "epochs", id] => ("epoch_get", *c, *id, "GET"),
+        ["chains", c, "epochs", id, "recovery-envelope"] => ("recovery", *c, *id, "GET"),
+        ["chains", c, "epochs", id, "envelopes"] => ("envelopes_post", *c, *id, "POST"),
+        ["chains", c, "log"] => ("log", *c, "", "GET"),
+        ["chains", c, "log", "head"] => ("head", *c, "", "GET"),
+        ["chains", c, "log", "prune"] => ("prune", *c, "", "POST"),
+        ["chains", c, "snapshots"] => (
+            if method == "POST" {
+                "snapshot"
+            } else {
+                "snapshots_get"
+            },
+            *c,
+            "",
+            "GET, POST",
+        ),
+        ["chains", c, "snapshots", "parts"] => ("parts_post", *c, "", "POST"),
+        ["chains", c, "snapshots", "parts", id] => ("part_get", *c, *id, "GET"),
+        ["chains", c, "snapshots", id] => ("snapshot_get", *c, *id, "GET"),
+        ["chains", c, "export"] => ("export", *c, "", "GET"),
+        ["chains", c, "relay-notice"] => ("notice", *c, "", "GET"),
+        ["chains", c, "deletion"] => ("deletion", *c, "", "GET"),
+        ["chains", c, "receipts", id] => ("receipt", *c, *id, "GET"),
+        ["chains", c, "transparency", "head"] => ("transparency_head", *c, "", "GET"),
+        ["chains", c, "transparency", "entries"] => ("transparency", *c, "", "GET"),
+        _ => return Err(err("ENDPOINT_NOT_FOUND")),
     };
-
-    Ok(vendor_json(params))
-}
-
-pub async fn create_chain(
-    State(state): State<DbState>,
-    payload: Result<Json<ChainParameters>, JsonRejection>,
-) -> Result<(StatusCode, Response), ApiError> {
-    let Json(params) = payload.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    validate_chain_id(&params.chain_id)?;
-    validate_base64url("chain_salt", &params.chain_salt, Some(32), Some(32))?;
-    validate_base64url(
-        "admin_public_key",
-        &params.admin_public_key,
-        Some(32),
-        Some(32),
-    )?;
-    validate_base64url(
-        "creator_public_key",
-        &params.creator_public_key,
-        Some(32),
-        Some(32),
-    )?;
-    validate_uuid("creator_device_id", &params.creator_device_id)?;
-
-    let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
-    sqlx::query(
-        "INSERT INTO chains (chain_id, chain_salt, admin_public_key, created_at_ms, creator_device_id, creator_public_key) \
-         VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chain_id) DO NOTHING"
-    )
-    .bind(&params.chain_id)
-    .bind(&params.chain_salt)
-    .bind(&params.admin_public_key)
-    .bind(params.created_at_ms)
-    .bind(&params.creator_device_id)
-    .bind(&params.creator_public_key)
-    .execute(&mut *tx)
-    .await
-    .map_err(ApiError::database)?;
-
-    tx.commit().await.map_err(ApiError::database)?;
-
-    info!(chain = %short_id(&params.chain_id), "created new sync chain");
-    Ok((StatusCode::CREATED, vendor_json(params)))
-}
-
-pub async fn enroll_device(
-    State(state): State<DbState>,
-    Path(chain_id): Path<String>,
-    payload: Result<Json<serde_json::Value>, JsonRejection>,
-) -> Result<(StatusCode, Response), ApiError> {
-    validate_chain_id(&chain_id)?;
-    ensure_not_deleted(&state, &chain_id).await?;
-
-    let Json(value) = payload.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    let obj = value
-        .as_object()
-        .ok_or_else(|| ApiError::bad_request("Body must be a JSON object"))?;
-
-    let payload_chain_id = obj.get("chain_id").and_then(|v| v.as_str()).unwrap_or("");
-    if payload_chain_id != chain_id {
-        return Err(ApiError::bad_request(
-            "chain_id in path and body must match",
-        ));
+    if !allow.split(", ").any(|m| m == method) {
+        return Err(err("METHOD_NOT_ALLOWED"));
     }
-
-    let device_id = obj.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
-    validate_uuid("device_id", device_id)?;
-
-    let device_public_key = obj
-        .get("device_public_key")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    validate_base64url("device_public_key", device_public_key, Some(32), Some(32))?;
-
-    let encrypted_device_name = obj
-        .get("encrypted_device_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let device_name_nonce = obj
-        .get("device_name_nonce")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let created_at_ms = obj
-        .get("created_at_ms")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let signature = obj.get("signature").and_then(|v| v.as_str()).unwrap_or("");
-    let status = obj
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("active");
-    let updated_at_ms = obj
-        .get("updated_at_ms")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(created_at_ms);
-
-    let valid = verify_signed_json(device_public_key, signature, &value, CTX_DEVICE_RECORD)
-        .map_err(ApiError::bad_request)?;
-    if !valid {
-        return Err(ApiError::invalid_signature(
-            "Invalid enrollment device signature",
-        ));
+    if !chain.is_empty() {
+        decode(chain, Some(32)).map_err(|_| err("INVALID_FIELD"))?;
     }
-
-    let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let final_updated_at_ms = if updated_at_ms != 0 {
-        updated_at_ms
-    } else {
-        now
-    };
-
-    sqlx::query(
-        "INSERT INTO devices (\
-            chain_id, device_id, device_public_key, encrypted_device_name, device_name_nonce, status, created_at_ms, updated_at_ms, signature\
-         ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?) \
-         ON CONFLICT(chain_id, device_id) DO UPDATE SET \
-            encrypted_device_name = excluded.encrypted_device_name, \
-            device_name_nonce = excluded.device_name_nonce, \
-            created_at_ms = excluded.created_at_ms, \
-            updated_at_ms = excluded.updated_at_ms, \
-            signature = excluded.signature"
-    )
-    .bind(&chain_id)
-    .bind(device_id)
-    .bind(device_public_key)
-    .bind(encrypted_device_name)
-    .bind(device_name_nonce)
-    .bind(created_at_ms)
-    .bind(final_updated_at_ms)
-    .bind(signature)
-    .execute(&mut *tx)
-    .await
-    .map_err(ApiError::database)?;
-
-    tx.commit().await.map_err(ApiError::database)?;
-
-    let record = DeviceRecord {
-        protocol_version: PROTOCOL_VERSION.to_string(),
-        chain_id: chain_id.clone(),
-        device_id: device_id.to_string(),
-        device_public_key: device_public_key.to_string(),
-        encrypted_device_name: encrypted_device_name.to_string(),
-        device_name_nonce: device_name_nonce.to_string(),
-        status: status.to_string(),
-        created_at_ms,
-        updated_at_ms: final_updated_at_ms,
-        signature: signature.to_string(),
-    };
-
-    info!(chain = %short_id(&chain_id), device = %record.device_id, "enrolled active device");
-    Ok((StatusCode::CREATED, vendor_json(record)))
-}
-
-pub async fn post_records(
-    State(state): State<DbState>,
-    Path(chain_id): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    validate_chain_id(&chain_id)?;
-    ensure_not_deleted(&state, &chain_id).await?;
-
-    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
-    let _auth_device_id = verify_capability_token(
-        &state,
-        auth_header,
-        &chain_id,
-        "POST",
-        &format!("/pallasync/v2/chains/{chain_id}/records"),
-        "",
-        &body,
-    )
-    .await?;
-
-    // Parse JSON records (can be { "records": [...] } or direct [...])
-    let records: Vec<SyncRecord> =
-        if let Ok(wrapper) = serde_json::from_slice::<PostRecordsBody>(&body) {
-            wrapper.records
-        } else if let Ok(records) = serde_json::from_slice::<Vec<SyncRecord>>(&body) {
-            records
-        } else {
-            return Err(ApiError::bad_request("Malformed JSON records payload"));
-        };
-
-    info!(chain = %short_id(&chain_id), count = records.len(), "posting sync records");
-
-    let mut public_keys = HashMap::<String, (String, String)>::new();
-    let mut accepted_ids = Vec::new();
-    let mut duplicate_ids = Vec::new();
-    let mut rejected = Vec::new();
-
-    let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
-
-    for record in records {
-        if let Err(err) = validate_sync_record(&record, &chain_id) {
-            rejected.push(RejectedRecord {
-                record_id: record.record_id.clone(),
-                reason: err.detail,
-            });
-            continue;
+    let mut parameter = param.to_owned();
+    if !param.is_empty() {
+        if matches!(
+            route,
+            "epoch_get" | "recovery" | "envelopes_post" | "receipt"
+        ) {
+            parameter = read::decimal(
+                param,
+                if route == "receipt" { 1 } else { 0 },
+                if route == "receipt" {
+                    jcs::MAX_INTEGER
+                } else {
+                    u32::MAX as u64
+                },
+            )?
+            .to_string();
+        } else if !uuid(param) {
+            return Err(err("INVALID_FIELD"));
         }
-
-        let (public_key, status) = if let Some(entry) = public_keys.get(&record.device_id) {
-            entry.clone()
-        } else {
-            let row = sqlx::query(
-                "SELECT device_public_key, status FROM devices WHERE chain_id = ? AND device_id = ?"
-            )
-            .bind(&chain_id)
-            .bind(&record.device_id)
-            .fetch_optional(&mut *tx)
+    }
+    Ok(Endpoint {
+        route,
+        chain: chain.into(),
+        param: parameter,
+        allow,
+    })
+}
+pub async fn handle(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+    let mut transfer_permit = None;
+    let uri = request.uri().clone();
+    let method = request.method().clone();
+    let path = uri.path().to_owned();
+    let source = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip().to_string())
+        .unwrap_or_else(|| "local".into());
+    let (parts, body) = request.into_parts();
+    let result = async {
+        let max = n(state.config.limits(), "max_request_bytes") as usize;
+        let body = tokio::time::timeout(Duration::from_secs(30), to_bytes(body, max))
             .await
-            .map_err(ApiError::database)?;
-
-            if let Some(row) = row {
-                let key = row.get::<String, _>("device_public_key");
-                let st = row.get::<String, _>("status");
-                public_keys.insert(record.device_id.clone(), (key.clone(), st.clone()));
-                (key, st)
-            } else {
-                rejected.push(RejectedRecord {
-                    record_id: record.record_id.clone(),
-                    reason: format!("Device {} not enrolled", record.device_id),
-                });
-                continue;
+            .map_err(|_| err("REQUEST_TIMEOUT"))?
+            .map_err(|_| err("PAYLOAD_TOO_LARGE"))?;
+        if parts
+            .headers
+            .get(header::CONTENT_ENCODING)
+            .is_some_and(|h| !h.to_str().is_ok_and(|h| h.eq_ignore_ascii_case("identity")))
+        {
+            return Err(err("INVALID_FIELD"));
+        }
+        let q = canonical_query(uri.query().unwrap_or(""))?;
+        if matches!(path.as_str(), "/privacy.md" | "/privacy.json") {
+            if method != "GET" {
+                return Err(err("METHOD_NOT_ALLOWED"));
             }
-        };
-
-        if status != "active" {
-            rejected.push(RejectedRecord {
-                record_id: record.record_id.clone(),
-                reason: "Device is revoked".to_string(),
-            });
-            continue;
-        }
-
-        let value = match serde_json::to_value(&record) {
-            Ok(v) => v,
-            Err(e) => {
-                rejected.push(RejectedRecord {
-                    record_id: record.record_id.clone(),
-                    reason: e.to_string(),
-                });
-                continue;
+            if !q.is_empty() || !body.is_empty() {
+                return Err(err("INVALID_FIELD"));
             }
-        };
-
-        let is_valid = verify_signed_json(&public_key, &record.signature, &value, CTX_SYNC_RECORD)
-            .unwrap_or(false);
-        if !is_valid {
-            rejected.push(RejectedRecord {
-                record_id: record.record_id.clone(),
-                reason: "Invalid record signature".to_string(),
-            });
-            continue;
-        }
-
-        let res = sqlx::query(
-            "INSERT INTO sync_records (\
-                chain_id, record_id, protocol_version, epoch, collection_name, action, encrypted_payload,\
-                payload_nonce, device_id, lamport, created_at_ms, signature\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(chain_id, record_id) DO NOTHING"
-        )
-        .bind(&chain_id)
-        .bind(&record.record_id)
-        .bind(&record.protocol_version)
-        .bind(record.epoch)
-        .bind(&record.collection_name)
-        .bind(&record.action)
-        .bind(&record.encrypted_payload)
-        .bind(&record.payload_nonce)
-        .bind(&record.device_id)
-        .bind(record.lamport)
-        .bind(record.created_at_ms)
-        .bind(&record.signature)
-        .execute(&mut *tx)
-        .await
-        .map_err(ApiError::database)?;
-
-        if res.rows_affected() == 0 {
-            duplicate_ids.push(record.record_id);
-        } else {
-            accepted_ids.push(record.record_id);
-        }
-    }
-
-    tx.commit().await.map_err(ApiError::database)?;
-
-    let response = PostRecordsResponse {
-        accepted_record_ids: accepted_ids,
-        duplicate_record_ids: duplicate_ids,
-        rejected,
-    };
-
-    Ok(vendor_json(response))
-}
-
-pub async fn get_records(
-    State(state): State<DbState>,
-    Path(chain_id): Path<String>,
-    headers: HeaderMap,
-    query: Result<Query<RecordQuery>, QueryRejection>,
-) -> Result<Response, ApiError> {
-    let Query(query) = query.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    validate_chain_id(&chain_id)?;
-    ensure_not_deleted(&state, &chain_id).await?;
-
-    if (query.after_seq.is_some() || query.cursor.is_some()) && query.since_ms.is_some() {
-        return Err(ApiError::bad_request(
-            "Cannot specify both after_seq/cursor and since_ms",
-        ));
-    }
-
-    if let Some(l) = query.limit
-        && l > MAX_PAGE_LIMIT
-    {
-        return Err(ApiError::bad_request("limit exceeds maximum allowed limit"));
-    }
-
-    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
-    let query_str = query_to_string(&query);
-    let _auth_device_id = verify_capability_token(
-        &state,
-        auth_header,
-        &chain_id,
-        "GET",
-        &format!("/pallasync/v2/chains/{chain_id}/records"),
-        &query_str,
-        b"",
-    )
-    .await?;
-
-    if let Some(since) = query.since_ms {
-        let rows = sqlx::query(
-            "SELECT server_sequence, record_id, protocol_version, epoch, collection_name, action, encrypted_payload, \
-                    payload_nonce, device_id, lamport, created_at_ms, signature \
-             FROM sync_records \
-             WHERE chain_id = ? AND created_at_ms > ? \
-             ORDER BY created_at_ms ASC, server_sequence ASC"
-        )
-        .bind(&chain_id)
-        .bind(since)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::database)?;
-
-        let records = rows
-            .into_iter()
-            .map(|row| SyncRecord {
-                protocol_version: row.get("protocol_version"),
-                chain_id: chain_id.clone(),
-                record_id: row.get("record_id"),
-                epoch: row.get("epoch"),
-                collection_name: row.get("collection_name"),
-                action: row.get("action"),
-                encrypted_payload: row.get("encrypted_payload"),
-                payload_nonce: row.get("payload_nonce"),
-                device_id: row.get("device_id"),
-                lamport: row.get("lamport"),
-                created_at_ms: row.get("created_at_ms"),
-                signature: row.get("signature"),
-            })
-            .collect::<Vec<_>>();
-
-        let server_time_ms = chrono::Utc::now().timestamp_millis();
-        let resp = FetchRecordsResponse {
-            records,
-            next_cursor: None,
-            server_time_ms,
-        };
-        return Ok(vendor_json(resp));
-    }
-
-    let is_paged = query.after_seq.is_some() || query.cursor.is_some();
-    if !is_paged {
-        if query.limit.is_some() {
-            return Err(ApiError::bad_request(
-                "limit parameter requires cursor or after_seq",
-            ));
-        }
-
-        let rows = sqlx::query(
-            "SELECT server_sequence, record_id, protocol_version, epoch, collection_name, action, encrypted_payload, \
-                    payload_nonce, device_id, lamport, created_at_ms, signature \
-             FROM sync_records \
-             WHERE chain_id = ? \
-             ORDER BY server_sequence ASC"
-        )
-        .bind(&chain_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(ApiError::database)?;
-
-        let records = rows
-            .into_iter()
-            .map(|row| SyncRecord {
-                protocol_version: row.get("protocol_version"),
-                chain_id: chain_id.clone(),
-                record_id: row.get("record_id"),
-                epoch: row.get("epoch"),
-                collection_name: row.get("collection_name"),
-                action: row.get("action"),
-                encrypted_payload: row.get("encrypted_payload"),
-                payload_nonce: row.get("payload_nonce"),
-                device_id: row.get("device_id"),
-                lamport: row.get("lamport"),
-                created_at_ms: row.get("created_at_ms"),
-                signature: row.get("signature"),
-            })
-            .collect::<Vec<_>>();
-
-        let server_time_ms = chrono::Utc::now().timestamp_millis();
-        let resp = FetchRecordsResponse {
-            records,
-            next_cursor: None,
-            server_time_ms,
-        };
-        return Ok(vendor_json(resp));
-    }
-
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_PAGE_LIMIT)
-        .min(MAX_PAGE_LIMIT) as usize;
-    let after_seq = if let Some(ref cur) = query.cursor {
-        cur.parse::<i64>().unwrap_or(0)
-    } else {
-        query.after_seq.unwrap_or(0)
-    };
-
-    let rows = sqlx::query(
-        "SELECT server_sequence, record_id, protocol_version, epoch, collection_name, action, encrypted_payload, \
-                payload_nonce, device_id, lamport, created_at_ms, signature \
-         FROM sync_records \
-         WHERE chain_id = ? AND server_sequence > ? \
-         ORDER BY server_sequence ASC LIMIT ?"
-    )
-    .bind(&chain_id)
-    .bind(after_seq)
-    .bind((limit + 1) as i64)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::database)?;
-
-    let has_more = rows.len() > limit;
-    let mut max_seq = after_seq;
-    let mut records = Vec::with_capacity(rows.len().min(limit));
-
-    for row in rows.into_iter().take(limit) {
-        let seq = row.get::<i64, _>("server_sequence");
-        max_seq = max_seq.max(seq);
-        records.push(SyncRecord {
-            protocol_version: row.get("protocol_version"),
-            chain_id: chain_id.clone(),
-            record_id: row.get("record_id"),
-            epoch: row.get("epoch"),
-            collection_name: row.get("collection_name"),
-            action: row.get("action"),
-            encrypted_payload: row.get("encrypted_payload"),
-            payload_nonce: row.get("payload_nonce"),
-            device_id: row.get("device_id"),
-            lamport: row.get("lamport"),
-            created_at_ms: row.get("created_at_ms"),
-            signature: row.get("signature"),
-        });
-    }
-
-    let next_cursor = if has_more {
-        Some(max_seq.to_string())
-    } else {
-        None
-    };
-    let server_time_ms = chrono::Utc::now().timestamp_millis();
-
-    let resp = FetchRecordsResponse {
-        records,
-        next_cursor,
-        server_time_ms,
-    };
-
-    Ok(paged_vendor_json(resp, max_seq, has_more))
-}
-
-pub async fn get_devices(
-    State(state): State<DbState>,
-    Path(chain_id): Path<String>,
-    headers: HeaderMap,
-    query: Result<Query<DeviceQuery>, QueryRejection>,
-) -> Result<Response, ApiError> {
-    let Query(query) = query.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    validate_chain_id(&chain_id)?;
-    ensure_not_deleted(&state, &chain_id).await?;
-
-    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
-    let query_str = query_to_string_device(&query);
-    let _auth_device_id = verify_capability_token(
-        &state,
-        auth_header,
-        &chain_id,
-        "GET",
-        &format!("/pallasync/v2/chains/{chain_id}/devices"),
-        &query_str,
-        b"",
-    )
-    .await?;
-
-    if let Some(l) = query.limit
-        && l > MAX_DEVICE_PAGE_LIMIT
-    {
-        return Err(ApiError::bad_request(
-            "limit exceeds maximum allowed limit of 200",
-        ));
-    }
-
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_DEVICE_PAGE_LIMIT)
-        .min(MAX_DEVICE_PAGE_LIMIT) as usize;
-
-    let after_created_at_ms = if let Some(ref cur) = query.cursor {
-        cur.parse::<i64>().unwrap_or(0)
-    } else {
-        0
-    };
-
-    let rows = sqlx::query(
-        "SELECT device_id, device_public_key, encrypted_device_name, device_name_nonce, status, created_at_ms, updated_at_ms, signature \
-         FROM devices WHERE chain_id = ? AND created_at_ms > ? \
-         ORDER BY created_at_ms ASC, device_id ASC LIMIT ?"
-    )
-    .bind(&chain_id)
-    .bind(after_created_at_ms)
-    .bind((limit + 1) as i64)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(ApiError::database)?;
-
-    let has_more = rows.len() > limit;
-    let mut max_created_at = after_created_at_ms;
-    let mut devices = Vec::with_capacity(rows.len().min(limit));
-
-    for row in rows.into_iter().take(limit) {
-        let created_at: i64 = row.get("created_at_ms");
-        max_created_at = max_created_at.max(created_at);
-        devices.push(DeviceRecord {
-            protocol_version: PROTOCOL_VERSION.to_string(),
-            chain_id: chain_id.clone(),
-            device_id: row.get("device_id"),
-            device_public_key: row.get("device_public_key"),
-            encrypted_device_name: row.get("encrypted_device_name"),
-            device_name_nonce: row.get("device_name_nonce"),
-            status: row.get("status"),
-            created_at_ms: created_at,
-            updated_at_ms: row.get("updated_at_ms"),
-            signature: row.get("signature"),
-        });
-    }
-
-    let next_cursor = if has_more {
-        Some(max_created_at.to_string())
-    } else {
-        None
-    };
-
-    let resp = GetDevicesResponse {
-        devices,
-        next_cursor,
-    };
-
-    Ok(vendor_json(resp))
-}
-
-pub async fn update_device(
-    State(state): State<DbState>,
-    Path((chain_id, device_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<StatusCode, ApiError> {
-    validate_chain_id(&chain_id)?;
-    validate_uuid("device_id", &device_id)?;
-    ensure_not_deleted(&state, &chain_id).await?;
-
-    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
-    let auth_device_id = verify_capability_token(
-        &state,
-        auth_header,
-        &chain_id,
-        "PUT",
-        &format!("/pallasync/v2/chains/{chain_id}/devices/{device_id}"),
-        "",
-        &body,
-    )
-    .await?;
-
-    if auth_device_id != device_id {
-        return Err(ApiError::forbidden(
-            "forbidden",
-            "Cannot update another device's metadata",
-        ));
-    }
-
-    let device: DeviceRecord =
-        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
-
-    let value = serde_json::to_value(&device).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let valid = verify_signed_json(
-        &device.device_public_key,
-        &device.signature,
-        &value,
-        CTX_DEVICE_RECORD,
-    )
-    .map_err(ApiError::bad_request)?;
-    if !valid {
-        return Err(ApiError::invalid_signature("Invalid device self-signature"));
-    }
-
-    let now = chrono::Utc::now().timestamp_millis();
-    sqlx::query(
-        "UPDATE devices SET encrypted_device_name = ?, device_name_nonce = ?, updated_at_ms = ?, signature = ? \
-         WHERE chain_id = ? AND device_id = ? AND status = 'active'"
-    )
-    .bind(&device.encrypted_device_name)
-    .bind(&device.device_name_nonce)
-    .bind(now)
-    .bind(&device.signature)
-    .bind(&chain_id)
-    .bind(&device_id)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::database)?;
-
-    Ok(StatusCode::NO_CONTENT)
-}
-
-pub async fn revoke_device(
-    State(state): State<DbState>,
-    Path((chain_id, device_id)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<StatusCode, ApiError> {
-    validate_chain_id(&chain_id)?;
-    validate_uuid("device_id", &device_id)?;
-    ensure_not_deleted(&state, &chain_id).await?;
-
-    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
-    let _auth_device_id = verify_capability_token(
-        &state,
-        auth_header,
-        &chain_id,
-        "POST",
-        &format!("/pallasync/v2/chains/{chain_id}/devices/{device_id}/revoke"),
-        "",
-        &body,
-    )
-    .await?;
-
-    let req: AdminOpRequest =
-        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
-
-    let admin_key = sqlx::query("SELECT admin_public_key FROM chains WHERE chain_id = ?")
-        .bind(&chain_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(ApiError::database)?
-        .map(|r| r.get::<String, _>("admin_public_key"))
-        .ok_or_else(|| ApiError::not_found("chain_not_found", "Chain not found"))?;
-
-    let value = serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let valid = verify_signed_json(&admin_key, &req.admin_proof, &value, CTX_ADMIN_OP)
-        .map_err(ApiError::bad_request)?;
-    if !valid {
-        return Err(ApiError::forbidden(
-            "invalid_signature",
-            "Invalid admin proof",
-        ));
-    }
-
-    sqlx::query("UPDATE devices SET status = 'revoked' WHERE chain_id = ? AND device_id = ?")
-        .bind(&chain_id)
-        .bind(&device_id)
-        .execute(&state.pool)
-        .await
-        .map_err(ApiError::database)?;
-
-    info!(chain = %short_id(&chain_id), device = %device_id, "revoked device");
-    Ok(StatusCode::OK)
-}
-
-pub async fn delete_chain(
-    State(state): State<DbState>,
-    Path(chain_id): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<StatusCode, ApiError> {
-    validate_chain_id(&chain_id)?;
-    ensure_not_deleted(&state, &chain_id).await?;
-
-    let auth_header = headers.get("authorization").and_then(|h| h.to_str().ok());
-    let _auth_device_id = verify_capability_token(
-        &state,
-        auth_header,
-        &chain_id,
-        "DELETE",
-        &format!("/pallasync/v2/chains/{chain_id}"),
-        "",
-        &body,
-    )
-    .await?;
-
-    let req: AdminOpRequest =
-        serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(e.to_string()))?;
-
-    let admin_key = sqlx::query("SELECT admin_public_key FROM chains WHERE chain_id = ?")
-        .bind(&chain_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(ApiError::database)?
-        .map(|r| r.get::<String, _>("admin_public_key"))
-        .ok_or_else(|| ApiError::not_found("chain_not_found", "Chain not found"))?;
-
-    let value = serde_json::to_value(&req).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let valid = verify_signed_json(&admin_key, &req.admin_proof, &value, CTX_ADMIN_OP)
-        .map_err(ApiError::bad_request)?;
-    if !valid {
-        return Err(ApiError::forbidden(
-            "invalid_signature",
-            "Invalid admin proof",
-        ));
-    }
-
-    let mut tx = state.pool.begin().await.map_err(ApiError::database)?;
-    let now = chrono::Utc::now().timestamp_millis();
-    sqlx::query("UPDATE chains SET deleted_at_ms = ? WHERE chain_id = ?")
-        .bind(now)
-        .bind(&chain_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(ApiError::database)?;
-
-    sqlx::query("DELETE FROM sync_records WHERE chain_id = ?")
-        .bind(&chain_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(ApiError::database)?;
-
-    sqlx::query("DELETE FROM devices WHERE chain_id = ?")
-        .bind(&chain_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(ApiError::database)?;
-
-    tx.commit().await.map_err(ApiError::database)?;
-
-    info!(chain = %short_id(&chain_id), "permanently deleted chain");
-    Ok(StatusCode::OK)
-}
-
-async fn verify_capability_token(
-    state: &DbState,
-    auth_header: Option<&str>,
-    chain_id: &str,
-    method: &str,
-    path: &str,
-    query: &str,
-    body: &[u8],
-) -> Result<String, ApiError> {
-    let header = match auth_header {
-        Some(h) if !h.trim().is_empty() => h.trim(),
-        _ => {
-            return Err(ApiError::unauthorized(
-                "missing_authorization",
-                "Missing Authorization header",
-            ));
-        }
-    };
-
-    let token_b64 = header
-        .strip_prefix("PallaSync ")
-        .or_else(|| header.strip_prefix("Bearer "))
-        .ok_or_else(|| {
-            ApiError::unauthorized(
-                "invalid_token",
-                "Authorization header must use PallaSync scheme",
+            let mut tx = state.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let limited = auth::rate(
+                &mut tx,
+                &state.config,
+                "public_document_ip",
+                &hash_bytes(source.as_bytes()),
             )
-        })?;
-
-    let token_bytes = URL_SAFE_NO_PAD
-        .decode(token_b64)
-        .map_err(|_| ApiError::unauthorized("invalid_token", "Invalid Base64URL token"))?;
-
-    let token: CapabilityToken = serde_json::from_slice(&token_bytes)
-        .map_err(|_| ApiError::unauthorized("invalid_token", "Invalid token JSON"))?;
-
-    if token.v != 1 {
-        return Err(ApiError::unauthorized(
-            "invalid_token",
-            "Unsupported token version",
-        ));
-    }
-    if token.chain_id != chain_id {
-        return Err(ApiError::unauthorized(
-            "invalid_token",
-            "Token chain_id mismatch",
-        ));
-    }
-    if token.method.to_uppercase() != method.to_uppercase() {
-        return Err(ApiError::unauthorized(
-            "invalid_token",
-            "Token method mismatch",
-        ));
-    }
-    if !token.path.is_empty() && token.path != path {
-        return Err(ApiError::unauthorized(
-            "invalid_token",
-            "Token path mismatch",
-        ));
-    }
-    if !token.query.is_empty() && token.query != query {
-        return Err(ApiError::unauthorized(
-            "invalid_token",
-            "Token query mismatch",
-        ));
-    }
-
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    if token.issued_at_ms > now_ms + 5 * 60 * 1000 {
-        return Err(ApiError::unauthorized(
-            "invalid_token",
-            "Token issued in the future",
-        ));
-    }
-    if token.expires_at_ms < now_ms {
-        return Err(ApiError::unauthorized("expired_token", "Token has expired"));
-    }
-
-    let body_hash = URL_SAFE_NO_PAD.encode(Sha256::digest(body));
-    if !token.body_sha256.is_empty() && token.body_sha256 != body_hash {
-        return Err(ApiError::unauthorized(
-            "invalid_token",
-            "Token body_sha256 mismatch",
-        ));
-    }
-
-    let row = sqlx::query(
-        "SELECT device_public_key, status FROM devices WHERE chain_id = ? AND device_id = ?",
-    )
-    .bind(chain_id)
-    .bind(&token.device_id)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(ApiError::database)?
-    .ok_or_else(|| ApiError::unauthorized("not_enrolled", "Device is not enrolled"))?;
-
-    let status = row.get::<String, _>("status");
-    if status != "active" {
-        return Err(ApiError::forbidden(
-            "device_revoked",
-            "Device has been revoked",
-        ));
-    }
-    let pub_key = row.get::<String, _>("device_public_key");
-
-    let token_val =
-        serde_json::to_value(&token).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let valid = verify_signed_json(&pub_key, &token.signature, &token_val, CTX_CAPABILITY)
-        .map_err(ApiError::bad_request)?;
-    if !valid {
-        return Err(ApiError::unauthorized(
-            "invalid_signature",
-            "Invalid token signature",
-        ));
-    }
-
-    // Purge expired nonces
-    let _ = sqlx::query("DELETE FROM replay_nonces WHERE expires_at_ms < ?")
-        .bind(now_ms)
-        .execute(&state.pool)
-        .await;
-
-    // Check and record replay nonce
-    let insert_res = sqlx::query(
-        "INSERT INTO replay_nonces (chain_id, device_id, nonce, expires_at_ms) VALUES (?, ?, ?, ?) \
-         ON CONFLICT(chain_id, device_id, nonce) DO NOTHING",
-    )
-    .bind(chain_id)
-    .bind(&token.device_id)
-    .bind(&token.nonce)
-    .bind(token.expires_at_ms)
-    .execute(&state.pool)
-    .await
-    .map_err(ApiError::database)?;
-
-    if insert_res.rows_affected() == 0 {
-        return Err(ApiError::unauthorized(
-            "invalid_token",
-            "Replay nonce reused",
-        ));
-    }
-
-    Ok(token.device_id)
-}
-
-async fn ensure_not_deleted(state: &DbState, chain_id: &str) -> Result<(), ApiError> {
-    let row = sqlx::query("SELECT deleted_at_ms FROM chains WHERE chain_id = ?")
-        .bind(chain_id)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(ApiError::database)?;
-
-    match row {
-        Some(r) => {
-            let deleted: Option<i64> = r.get("deleted_at_ms");
-            if deleted.is_some() {
-                warn!(chain = %short_id(chain_id), "request for deleted chain");
-                Err(ApiError::gone())
+            .await;
+            tx.commit().await?;
+            limited?;
+            return Ok(if path == "/privacy.md" {
+                raw_response(
+                    200,
+                    "text/markdown;charset=utf-8",
+                    (*state.config.markdown).clone(),
+                )
             } else {
-                Ok(())
+                raw_response(
+                    200,
+                    "application/json",
+                    jcs::canonicalize_json(&state.config.privacy).unwrap(),
+                )
+            });
+        }
+        let mut ep = endpoint(&path, method.as_str())?;
+        if ep.route == "health" {
+            if !q.is_empty() || !body.is_empty() {
+                return Err(err("FILTER_NOT_ALLOWED"));
+            }
+            return Ok(json_response(200, &state.config.health()));
+        }
+        let parsed = if method == "GET" {
+            if body.is_empty() {
+                Ok(Value::Null)
+            } else {
+                Err(err("INVALID_FIELD"))
+            }
+        } else {
+            let ct = parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("");
+            if !ct.parse::<mime::Mime>().is_ok_and(|m| {
+                m.essence_str().eq_ignore_ascii_case(VENDOR_MEDIA_TYPE)
+                    && m.get_param(mime::CHARSET)
+                        .is_none_or(|c| c.as_str().eq_ignore_ascii_case("utf-8"))
+            }) {
+                Err(err("UNSUPPORTED_MEDIA_TYPE"))
+            } else {
+                jcs::parse(&body).map_err(|_| err("INVALID_JSON"))
+            }
+        };
+        // Genesis/import need the proposed public admin key; existing chains authenticate raw bytes before parsing.
+        let bootstrap = if matches!(ep.route, "genesis" | "import" | "request") {
+            parsed.clone()?
+        } else {
+            Value::Null
+        };
+        let proposed = if ep.route == "genesis" {
+            Some(&bootstrap["parameters"])
+        } else if ep.route == "import" {
+            a(&bootstrap, "parameters_history").last()
+        } else {
+            None
+        };
+        if let Some(p) = proposed {
+            validate(p, "parameters")?;
+            ep.chain = s(p, "chain_id").into();
+        }
+        if ep.chain.is_empty() {
+            return Err(err("INVALID_FIELD"));
+        }
+        if ep.route == "request" {
+            let value = bootstrap;
+            state
+                .config
+                .write_guard()
+                .map_err(|_| err("OFFER_NOT_FOUND"))?;
+            let mut tx = state.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+            let r = async {
+                auth::rate(
+                    &mut tx,
+                    &state.config,
+                    "enrollment_source_ip",
+                    &hash_bytes(source.as_bytes()),
+                )
+                .await?;
+                auth::rate(
+                    &mut tx,
+                    &state.config,
+                    "enrollment_offer",
+                    &format!("{}:{}", ep.chain, s(&value, "request_id")),
+                )
+                .await?;
+                sqlx::query("SAVEPOINT enrollment_candidate")
+                    .execute(&mut *tx)
+                    .await?;
+                let candidate = async {
+                    read::allowed(&q, &[])?;
+                    if deletion::proof(&mut tx, &ep.chain).await?.is_some() {
+                        return Err(err("OFFER_NOT_FOUND"));
+                    }
+                    let c = store::load(&mut tx, &ep.chain)
+                        .await?
+                        .filter(|c| c.writable)
+                        .ok_or_else(|| err("OFFER_NOT_FOUND"))?;
+                    let (status, v) = mutation::enrollment_request(&mut tx, &c, &value).await?;
+                    store::quota(&mut tx, &ep.chain, &state.config).await?;
+                    Ok((status, v))
+                }
+                .await;
+                if candidate.is_err() {
+                    sqlx::query("ROLLBACK TO enrollment_candidate")
+                        .execute(&mut *tx)
+                        .await?;
+                }
+                sqlx::query("RELEASE enrollment_candidate")
+                    .execute(&mut *tx)
+                    .await?;
+                candidate
+            }
+            .await;
+            // Preserve IP/offer rate accounting even for invalid unauthenticated offers.
+            tx.commit().await?;
+            let (status, v) = r?;
+            return Ok(json_response(status, &v));
+        }
+        let mut tx = state.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let authorized = auth::authenticate(
+            &mut tx,
+            &state.config,
+            auth::AuthRequest {
+                headers: &parts.headers,
+                method: &method,
+                uri: &uri,
+                body: &body,
+                chain_id: &ep.chain,
+                proposed_key: proposed.map(|p| s(p, "admin_public_key")),
+                route: ep.route,
+            },
+        )
+        .await;
+        // An authenticated nonce is consumed even when later authorization/validation fails.
+        tx.commit().await?;
+        let authorized = authorized?;
+        let value = parsed?;
+        if method != "GET" && ep.route != "delete" {
+            state.config.write_guard()?;
+        }
+        if matches!(
+            ep.route,
+            "records_post" | "parts_post" | "repair" | "envelopes_post"
+        ) {
+            read::allowed(&q, &[])?;
+            if matches!(ep.route, "records_post" | "parts_post") {
+                let mut tx = state.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+                let rate = auth::rate(
+                    &mut tx,
+                    &state.config,
+                    "record_upload_device",
+                    &format!(
+                        "{}:{}",
+                        ep.chain,
+                        authorized.device.as_deref().unwrap_or("admin")
+                    ),
+                )
+                .await;
+                tx.commit().await?;
+                rate?;
+            }
+            let v = batch::upload(
+                &state.db,
+                &state.config,
+                &authorized,
+                &ep.chain,
+                ep.route,
+                &ep.param,
+                &value,
+            )
+            .await?;
+            return Ok(json_response(200, &v));
+        }
+        transfer_permit = if matches!(ep.route, "export" | "part_get") {
+            let sem = state
+                .transfers
+                .lock()
+                .await
+                .entry(ep.chain.clone())
+                .or_insert_with(|| Arc::new(Semaphore::new(2)))
+                .clone();
+            Some(sem.try_acquire_owned().map_err(|_| {
+                err("RATE_LIMITED")
+                    .context(json!({"retry_after_ms":1000,"scope":"concurrent_transfers"}))
+            })?)
+        } else {
+            None
+        };
+        let mut tx = state.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+        if let Some(proof) = deletion::proof(&mut tx, &ep.chain).await? {
+            if ep.route == "deletion" {
+                read::allowed(&q, &[])?;
+                tx.commit().await?;
+                return Ok(json_response(200, &proof));
+            }
+            if ep.route == "delete" {
+                let row =
+                    sqlx::query("SELECT request_hash,outcome FROM v3_deletions WHERE chain_id=?")
+                        .bind(&ep.chain)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if row.get::<String, _>("request_hash") == object_hash(&value) {
+                    let v = store::value(row.get("outcome"));
+                    tx.commit().await?;
+                    return Ok(json_response(202, &v));
+                }
+            }
+            return Err(deletion::gone(&proof));
+        }
+        let result = async {
+            if ep.route == "genesis" {
+                read::allowed(&q, &[])?;
+                let (status, v, _) = mutation::genesis(&mut tx, &state.config, &value).await?;
+                Ok(json_response(status, &v))
+            } else if ep.route == "import" {
+                authorized.require_admin()?;
+                read::allowed(&q, &[])?;
+                let (v, _) = import::stage(&mut tx, &state.config, &value).await?;
+                Ok(json_response(202, &v))
+            } else {
+                let mut c = store::load(&mut tx, &ep.chain)
+                    .await?
+                    .ok_or_else(|| err("CHAIN_NOT_FOUND"))?;
+                if !c.writable && !(authorized.admin() && ep.route == "reseed") {
+                    return Err(err("CHAIN_NOT_FOUND"));
+                }
+                auth::check_state(&mut tx, &c, &authorized, ep.route).await?;
+                let r =
+                    dispatch(&mut tx, &mut c, &state.config, &authorized, &ep, &q, &value).await;
+                match r {
+                    Ok(response) => {
+                        if method != "GET" {
+                            store::save(&mut tx, &c, &state.config).await?;
+                            store::quota(&mut tx, &c.chain_id, &state.config).await?;
+                        }
+                        Ok(response)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
-        None => {
-            warn!(chain = %short_id(chain_id), "request for non-existent chain");
-            Err(ApiError::not_found("chain_not_found", "Chain not found"))
+        .await;
+        match result {
+            Ok(response) => {
+                tx.commit().await?;
+                if ep.route == "delete" {
+                    // The initial immutable 202 receipt remains the retry result; completion is separately attested.
+                    let _ = deletion::complete(&state.db, &state.config).await;
+                }
+                Ok(response)
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                audit_reject(&state, &ep.chain, &value, e.code).await?;
+                Err(e)
+            }
         }
     }
-}
-
-fn validate_sync_record(record: &SyncRecord, path_chain_id: &str) -> Result<(), ApiError> {
-    if record.protocol_version != PROTOCOL_VERSION && record.protocol_version != "2.0" {
-        return Err(ApiError::bad_request("protocol_version must be 2.1"));
-    }
-    if record.chain_id != path_chain_id {
-        return Err(ApiError::bad_request(
-            "chain_id in path and body must match",
-        ));
-    }
-    validate_uuid("record_id", &record.record_id)?;
-    validate_uuid("device_id", &record.device_id)?;
-    if record.collection_name.is_empty() || record.collection_name.len() > 128 {
-        return Err(ApiError::bad_request(
-            "collection_name must contain between 1 and 128 bytes",
-        ));
-    }
-    if record.action != "upsert" && record.action != "delete" {
-        return Err(ApiError::bad_request("action must be upsert or delete"));
-    }
-    validate_base64url(
-        "encrypted_payload",
-        &record.encrypted_payload,
-        Some(16),
-        Some(MAX_CIPHERTEXT_BYTES),
-    )?;
-    validate_base64url("signature", &record.signature, Some(64), Some(64))?;
-    Ok(())
-}
-
-fn validate_chain_id(chain_id: &str) -> Result<(), ApiError> {
-    validate_base64url("chain_id", chain_id, Some(32), Some(32))
-}
-
-fn validate_uuid(name: &str, value: &str) -> Result<(), ApiError> {
-    let uuid = Uuid::parse_str(value)
-        .map_err(|_| ApiError::bad_request(format!("{name} must be a UUID")))?;
-    if uuid.to_string() != value.to_ascii_lowercase() {
-        return Err(ApiError::bad_request(format!(
-            "{name} must use canonical hyphenated UUID form"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_base64url(
-    name: &str,
-    value: &str,
-    min_decoded_len: Option<usize>,
-    max_decoded_len: Option<usize>,
-) -> Result<(), ApiError> {
-    let decoded = URL_SAFE_NO_PAD
-        .decode(value)
-        .map_err(|_| ApiError::bad_request(format!("{name} must be unpadded Base64URL")))?;
-    if URL_SAFE_NO_PAD.encode(&decoded) != value {
-        return Err(ApiError::bad_request(format!(
-            "{name} must use canonical unpadded Base64URL"
-        )));
-    }
-    if min_decoded_len.is_some_and(|min| decoded.len() < min)
-        || max_decoded_len.is_some_and(|max| decoded.len() > max)
+    .await;
+    let mut response = result.unwrap_or_else(IntoResponse::into_response);
+    if let Some(permit) = transfer_permit
+        && response.status().is_success()
     {
-        return Err(ApiError::bad_request(format!("{name} byte length invalid")));
+        let (parts, body) = response.into_parts();
+        response = Response::from_parts(
+            parts,
+            Body::new(LeasedBody {
+                body,
+                _permit: permit,
+            }),
+        );
+    }
+    if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+        let allow = endpoint(&path, "GET")
+            .or_else(|_| endpoint(&path, "POST"))
+            .or_else(|_| endpoint(&path, "PUT"))
+            .or_else(|_| endpoint(&path, "DELETE"))
+            .map(|ep| ep.allow)
+            .unwrap_or("GET");
+        response
+            .headers_mut()
+            .insert(header::ALLOW, allow.parse().unwrap());
+    }
+    response.headers_mut().insert(
+        header::DATE,
+        httpdate::fmt_http_date(std::time::SystemTime::now())
+            .parse()
+            .unwrap(),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    response.headers_mut().insert(
+        "x-pallasync-protocol",
+        header::HeaderValue::from_static("pallasync/3"),
+    );
+    response
+}
+struct LeasedBody {
+    body: Body,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl http_body::Body for LeasedBody {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>>
+    {
+        std::pin::Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+}
+fn raw_response(status: u16, ct: &str, bytes: Vec<u8>) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, ct)
+        .body(Body::from(bytes))
+        .unwrap()
+}
+pub fn json_response(status: u16, v: &Value) -> Response<Body> {
+    raw_response(
+        status,
+        VENDOR_MEDIA_TYPE,
+        jcs::canonicalize_json(v).unwrap(),
+    )
+}
+
+async fn dispatch(
+    db: &mut sqlx::SqliteConnection,
+    c: &mut Chain,
+    cfg: &RelayConfig,
+    auth: &Auth,
+    ep: &Endpoint,
+    q: &[(String, String)],
+    v: &Value,
+) -> Result<Response<Body>> {
+    if !matches!(
+        ep.route,
+        "devices"
+            | "epochs_get"
+            | "own_envelopes"
+            | "snapshots_get"
+            | "requests_get"
+            | "records_get"
+            | "log"
+            | "export"
+            | "transparency"
+            | "receipt"
+    ) {
+        read::allowed(q, &[])?
+    }
+    let (status, value) = match ep.route {
+        "parameters_get" => (
+            200,
+            json!({"parameters":c.parameters,"parameters_hash":c.parameters_hash(),"epoch_hash":c.epoch_hash(),"log_id":c.log_id,"generation":c.generation(),"head_seq":c.head_seq,"head_hash":c.head_hash,"server_time_ms":now(),"quota":{"used_bytes":store::used(db,&c.chain_id).await?,"max_bytes":cfg.max_bytes}}),
+        ),
+        "head" => (200, c.head()),
+        "notice" => {
+            let published: Option<String> =
+                sqlx::query_scalar("SELECT notice FROM v3_notices WHERE chain_id=?")
+                    .bind(&c.chain_id)
+                    .fetch_optional(db)
+                    .await?;
+            (200,published.map(store::value).unwrap_or_else(||json!({"shutdown_at_ms":null,"migration_origin":null,"notice_id":c.notice_id,"server_time_ms":now()})))
+        }
+        "devices" | "epochs_get" | "snapshots_get" | "own_envelopes" => (
+            200,
+            read::objects(db, c, cfg, auth, ep.route, &ep.param, q).await?,
+        ),
+        "records_get" | "log" => (200, read::log(db, c, cfg, auth, ep.route, q).await?),
+        "epoch_get" => {
+            let epoch = store::object(&mut *db, &c.chain_id, "epoch", &ep.param)
+                .await?
+                .ok_or_else(|| err("EPOCH_NOT_FOUND"))?;
+            (200, read::epoch_wrapper(db, c, &epoch).await?)
+        }
+        "recovery" => {
+            auth.require_admin()
+                .map_err(|_| err("ENVELOPE_ACCESS_DENIED"))?;
+            if super::retention::expired(&mut *db, c, ep.param.parse().unwrap()).await? {
+                return Err(err("HISTORY_KEY_EXPIRED"));
+            }
+            let epoch = store::object(&mut *db, &c.chain_id, "epoch", &ep.param)
+                .await?
+                .ok_or_else(|| err("EPOCH_NOT_FOUND"))?;
+            let envelope:Option<String>=sqlx::query_scalar("SELECT body FROM v3_objects WHERE chain_id=? AND kind='envelope' AND object_hash=?").bind(&c.chain_id).bind(s(&epoch,"recovery_envelope_hash")).fetch_optional(db).await?.flatten();
+            (
+                200,
+                json!({"envelope":envelope.map(store::value).ok_or_else(||err("ENVELOPE_NOT_FOUND"))?}),
+            )
+        }
+        "part_get" => {
+            let record = store::object(&mut *db, &c.chain_id, "snapshot_part", &ep.param)
+                .await?
+                .ok_or_else(|| err("SNAPSHOT_PART_NOT_FOUND"))?;
+            if n(&record, "generation") > c.generation() {
+                return Err(err("SNAPSHOT_PART_NOT_FOUND"));
+            }
+            (
+                200,
+                json!({"record":record,"upload_receipt":store::receipt(db,&c.chain_id,"snapshot_part",&ep.param).await?}),
+            )
+        }
+        "snapshot_get" => (
+            200,
+            json!({"compaction":store::object(db,&c.chain_id,"compaction",&ep.param).await?.ok_or_else(||err("SNAPSHOT_NOT_FOUND"))?}),
+        ),
+        "transparency_head" => {
+            let head: String = sqlx::query_scalar(
+                "SELECT head FROM v3_heads WHERE chain_id=? AND transparency_id=? AND idx=?",
+            )
+            .bind(&c.chain_id)
+            .bind(&c.transparency_id)
+            .bind(c.transparency_index as i64)
+            .fetch_one(db)
+            .await?;
+            (200, json!({"head":store::value(head)}))
+        }
+        "transparency" => (200, read::transparency(db, c, cfg, q).await?),
+        "receipt" => {
+            read::allowed(q, &["log_id"])?;
+            let id = read::query(q, "log_id")
+                .filter(|s| uuid(s))
+                .ok_or_else(|| err("INVALID_FIELD"))?;
+            if id != c.log_id {
+                return Err(err("LOG_ID_MISMATCH"));
+            }
+            let row=sqlx::query("SELECT r.receipt,l.entry FROM v3_receipts r LEFT JOIN v3_log l ON l.chain_id=r.chain_id AND l.log_id=r.log_id AND l.seq=r.seq WHERE r.chain_id=? AND r.log_id=? AND r.seq=?").bind(&c.chain_id).bind(id).bind(ep.param.parse::<i64>().unwrap()).fetch_optional(db).await?.ok_or_else(||err("RECEIPT_NOT_FOUND"))?;
+            let entry = row
+                .get::<Option<String>, _>("entry")
+                .map(store::value)
+                .unwrap_or(Value::Null);
+            if !auth.admin() && entry["object"]["recipient_kind"] == "recovery" {
+                return Err(err("ENVELOPE_ACCESS_DENIED"));
+            }
+            (
+                200,
+                json!({"entry":entry,"receipt":store::value(row.get("receipt"))}),
+            )
+        }
+        "export" => {
+            return Ok(raw_response(
+                200,
+                EXPORT_MEDIA_TYPE,
+                export::export(db, c, cfg, auth, q).await?.into_bytes(),
+            ));
+        }
+        "enroll" => mutation::enroll(db, c, cfg, auth, v, None).await?,
+        "epochs_post" | "revoke" => {
+            mutation::epoch(
+                db,
+                c,
+                cfg,
+                auth,
+                v,
+                if ep.route == "revoke" {
+                    Some(&ep.param)
+                } else {
+                    None
+                },
+            )
+            .await?
+        }
+        "offer" => mutation::offer(db, c, auth, v).await?,
+        "approve" | "reject" => {
+            mutation::approve(db, c, cfg, auth, &ep.param, v, ep.route == "reject").await?
+        }
+        "ack" => (200, mutation::ack(db, c, auth, &ep.param, v).await?),
+        "snapshot" => mutation::snapshot(db, c, cfg, v).await?,
+        "prune" => (200, mutation::prune(db, c, cfg, auth, v).await?),
+        "reseed" => (200, import::reseed(db, c, cfg, auth, v).await?),
+        "delete" => (202, deletion::delete(db, c, cfg, auth, v).await?),
+        "deletion" => return Err(err("CHAIN_NOT_FOUND")),
+        "requests_get" => (200, requests(db, c, cfg, auth, q).await?),
+        _ => unreachable!("exhaustive routes"),
+    };
+    let response = json_response(status, &value);
+    if store::text(&value).len() > read::RESPONSE_MAX {
+        return Err(err("PAYLOAD_TOO_LARGE"));
+    }
+    Ok(response)
+}
+async fn requests(
+    db: &mut sqlx::SqliteConnection,
+    c: &Chain,
+    cfg: &RelayConfig,
+    auth: &Auth,
+    q: &[(String, String)],
+) -> Result<Value> {
+    read::allowed(q, &["cursor", "limit"])?;
+    let mut page = read::page(
+        &mut *db,
+        c,
+        cfg,
+        "requests_get",
+        q,
+        json!({"device_id":auth.device}),
+    )
+    .await?;
+    let rows=sqlx::query("SELECT request_id,request,offer,status FROM v3_offer_history h WHERE chain_id=? AND request_id>? AND request IS NOT NULL AND id=(SELECT MAX(id) FROM v3_offer_history WHERE chain_id=h.chain_id AND request_id=h.request_id AND id<=?) AND json_extract(offer,'$.generation')=? AND (json_extract(offer,'$.offering_device_id')=? OR ?=1) ORDER BY request_id LIMIT ?").bind(&c.chain_id).bind(&page.key).bind(n(&page.extra,"offer_version") as i64).bind(c.generation() as i64).bind(auth.device.as_deref().unwrap_or("")).bind(auth.admin()).bind(page.limit as i64+1).fetch_all(&mut *db).await?;
+    let more = rows.len() > page.limit;
+    let mut items = Vec::new();
+    for r in rows.into_iter().take(page.limit) {
+        page.key = r.get("request_id");
+        let request = store::value(r.get("request"));
+        let offer = store::value(r.get("offer"));
+        items.push(json!({"request_hash":object_hash(&request),"request":request,"status":r.get::<String,_>("status"),"offering_device_id":offer["offering_device_id"]}))
+    }
+    let next = if more {
+        Some(read::cursor(db, cfg, &page).await?)
+    } else {
+        None
+    };
+    Ok(
+        json!({"items":items,"next_cursor":next,"has_more":more,"log_id":page.cut.log_id,"generation":page.cut.generation(),"head_seq":page.cut.head_seq}),
+    )
+}
+async fn audit_reject(state: &AppState, chain: &str, v: &Value, code: &'static str) -> Result<()> {
+    if matches!(
+        code,
+        "RATE_LIMITED" | "QUOTA_EXCEEDED" | "STORAGE_UNAVAILABLE" | "INVALID_JSON"
+    ) {
+        return Ok(());
+    }
+    let mut candidates = Vec::new();
+    for (key, kind) in [
+        ("parameters", "parameters"),
+        ("device_record", "device"),
+        ("epoch", "epoch"),
+        ("compaction", "compaction"),
+        ("admin_operation", "admin"),
+    ] {
+        if let Some(obj) = v.get(key)
+            && validate(obj, kind).is_ok()
+        {
+            candidates.push(obj.clone())
+        }
+    }
+    for key in ["envelopes", "device_records"] {
+        for obj in a(v, key) {
+            if validate(
+                obj,
+                if key == "envelopes" {
+                    "envelope"
+                } else {
+                    "device"
+                },
+            )
+            .is_ok()
+            {
+                candidates.push(obj.clone())
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let mut tx = state.db.pool.begin_with("BEGIN IMMEDIATE").await?;
+    if let Some(mut c) = store::load(&mut tx, chain).await? {
+        for obj in candidates {
+            store::transparency(
+                &mut tx,
+                &mut c,
+                &state.config,
+                "reject",
+                &object_hash(&obj),
+                None,
+                Some(code),
+            )
+            .await?;
+        }
+        store::save(&mut tx, &c, &state.config).await?;
+        tx.commit().await?;
     }
     Ok(())
-}
-
-fn query_to_string(query: &RecordQuery) -> String {
-    let mut parts = Vec::new();
-    if let Some(ref c) = query.cursor {
-        parts.push(format!("cursor={c}"));
-    }
-    if let Some(s) = query.after_seq {
-        parts.push(format!("after_seq={s}"));
-    }
-    if let Some(since) = query.since_ms {
-        parts.push(format!("since_ms={since}"));
-    }
-    if let Some(l) = query.limit {
-        parts.push(format!("limit={l}"));
-    }
-    parts.join("&")
-}
-
-fn query_to_string_device(query: &DeviceQuery) -> String {
-    let mut parts = Vec::new();
-    if let Some(ref c) = query.cursor {
-        parts.push(format!("cursor={c}"));
-    }
-    if let Some(l) = query.limit {
-        parts.push(format!("limit={l}"));
-    }
-    parts.join("&")
-}
-
-fn vendor_json<T: Serialize>(value: T) -> Response {
-    let mut response = Json(value).into_response();
-    set_vendor_content_type(&mut response);
-    response
-}
-
-fn paged_vendor_json<T: Serialize>(value: T, next_seq: i64, has_more: bool) -> Response {
-    let mut response = vendor_json(value);
-    response.headers_mut().insert(
-        NEXT_SEQ_HEADER.clone(),
-        HeaderValue::from_str(&next_seq.to_string()).expect("i64 is always a header-safe value"),
-    );
-    response.headers_mut().insert(
-        HAS_MORE_HEADER.clone(),
-        HeaderValue::from_static(if has_more { "true" } else { "false" }),
-    );
-    response
-}
-
-fn set_vendor_content_type(response: &mut Response) {
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(VENDOR_MEDIA_TYPE));
-}
-
-fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
 }

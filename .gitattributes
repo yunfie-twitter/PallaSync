@@ -1,0 +1,4 @@
+# Preserve the exact attached normative document bytes and recorded checksums.
+docs/v3.0.md -text -whitespace
+docs/privacy.md -text -whitespace
+docs/privacy.schema.json -text -whitespace

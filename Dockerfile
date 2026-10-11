@@ -6,6 +6,7 @@ WORKDIR /app
 
 COPY Cargo.* ./
 COPY src ./src
+COPY docs/privacy.schema.json ./docs/privacy.schema.json
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
@@ -31,13 +32,13 @@ COPY --from=builder /tmp/pallasync-server /usr/local/bin/pallasync-server
 USER pallasync:pallasync
 WORKDIR /data
 
-ENV PORT=3000 \
+ENV PALLASYNC_BIND_ADDR=0.0.0.0:3000 \
     DATABASE_URL=sqlite:///data/pallasync.sqlite
 
 EXPOSE 3000
 VOLUME ["/data"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl --fail --silent --show-error "http://127.0.0.1:${PORT}/pallasync/v2/health" || exit 1
+    CMD curl --fail --silent --show-error "http://127.0.0.1:3000/pallasync/v3/health" || exit 1
 
 ENTRYPOINT ["/usr/local/bin/pallasync-server"]

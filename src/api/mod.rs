@@ -1,1 +1,13 @@
+pub mod auth;
+pub mod batch;
+pub mod deletion;
+pub mod domain;
+pub mod error;
+pub mod export;
+pub mod import;
+pub mod mutation;
+pub mod read;
+pub mod retention;
+pub mod store;
 pub mod sync;
+pub mod wire;
