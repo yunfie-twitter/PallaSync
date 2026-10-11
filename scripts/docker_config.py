@@ -146,7 +146,7 @@ def compose(profile, state):
         "environment": {"PALLASYNC_BIND_ADDR": "0.0.0.0:3000", "DATABASE_URL": "sqlite:///data/pallasync.sqlite",
                         "PALLASYNC_PRIVACY_MARKDOWN": "/policy/privacy.md", "PALLASYNC_PRIVACY_JSON": "/policy/privacy.json",
                         "PALLASYNC_RELAY_SIGNING_SEED_FILE": "/run/pallasync/relay-seed"},
-        "ports": [f"{profile['host_bind']}:{profile['host_port']}:3000"],
+        "ports": [f"{profile['host_port']}:3000" if profile["host_bind"] == "0.0.0.0" else f"{profile['host_bind']}:{profile['host_port']}:3000"],
         "volumes": ["pallasync-data:/data", {"type": "bind", "source": str(state / "policy"), "target": "/policy", "read_only": True}],
         "read_only": True, "tmpfs": ["/tmp:size=16m,mode=1777", "/run/pallasync:size=1m,mode=0700,uid=10001,gid=10001"],
         "cap_drop": ["ALL"], "security_opt": ["no-new-privileges:true"],
