@@ -14,6 +14,7 @@ from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_encrypt, crypto_aea
 from nacl.signing import SigningKey
 from protocol import b64, decode, digest, epoch_keys, hkdf_extract, hkdf_expand, jcs, object_hash, root_keys, signed, strict_loads, verify
 from artifact_boundary import require_normal_data
+from recovery_audit import validate_collection
 
 
 def hpke_key(recipient, ephemeral, info):
@@ -103,6 +104,7 @@ class CryptoClient:
 
     def record(self, collection, operations):
         require_normal_data(operations)
+        validate_collection(collection, operations)
         self.sequence += 1
         inner = {"collection":collection,"device_seq":self.sequence,"prev_record_hash":self.tail,"operations":operations}
         record = {"version":"3.0","chain_id":self.chain,"generation":getattr(self,"generation",0),"record_id":str(uuid.uuid4()),"device_id":self.device_id,"epoch":self.epoch,"collection_tag":None}
@@ -154,4 +156,6 @@ class CryptoClient:
         length = struct.unpack(">I",clear[:4])[0]
         if length > len(clear)-4:
             raise ValueError("C_SCHEMA_VIOLATION")
-        return strict_loads(clear[4:4+length])
+        inner = strict_loads(clear[4:4+length])
+        validate_collection(inner["collection"], inner["operations"])
+        return inner

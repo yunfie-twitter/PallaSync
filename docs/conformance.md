@@ -49,3 +49,7 @@ GF(256)は`galois`の多項式`0x11b`で検証します。隔離HTTPSリレー�
 テストはrelay側の構造・署名・認可・atomicity・公開hash/receipt・paging・storage動作を検証します。独立した2つのクライアントを用いたAppendix Bのend-to-end certification、実際のクライアント復号・state commitmentの再計算、Shamir ceremony、端末secure storage、実ディスク/停電試験、外部copyの消去、deployment TLSとoperator説明の真実性はこのサーバーのテストだけでは証明できません。これらをrelay側の復号機能で代替しません。
 
 acknowledged suffix lossからの復旧は、削除台帳・nonce状態・sourceの公開証拠を独立に照合し、staging/importと明示的admin re-seedを行います。live DBを古いバックアップで上書きする自動restore、旧log_idの偽装、未証明のhistorical acceptance、source receiptの再署名は実装しません。詳細はREADMEの運用手順を参照してください。
+
+§8.6の復旧監査をPython参照clientで独立に検査するよう追加しました（tests/reference/recovery_audit.py、test_recovery_audit.py）。公開メタデータ以外のfield、holder ID、誤ったt/n/count、whole-set／ceremonyの非null holder_kindを拒否します。全25 reference unit試験は1.003秒で成功しました。署名／AEAD roundtripは参照client内の試験で、Androidを含む三者ITの完了ではありません。relay runtimeへ復号／schema解釈を追加していません。
+
+2026-10-13の再検証ではserverの全26試験、fmt／clippy／bins build、独立Python／隔離HTTPS relayのepoch・CAS・atomic失効、peer承認、凍結legacy／nonce／旧版削除、Docker設定生成が通過しました（target/qualification-*.log）。Androidの全機能、全50 IT、production更新は完了していません。
