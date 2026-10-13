@@ -124,7 +124,7 @@ fn sign(draft: &Path, output: &Path, quota: Option<u64>) -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "Usage: pallasync-operator sign DRAFT_DIR POLICY_DIR QUOTA|none\n       pallasync-operator verify POLICY_DIR QUOTA|none\nSeed is read from stdin only; it is never printed.";
+    let usage = "Usage: pallasync-operator sign DRAFT_DIR POLICY_DIR QUOTA|none\n       pallasync-operator verify POLICY_DIR QUOTA|none\n       pallasync-operator retain-legacy-parameters ORIGINAL_JSON DATABASE_URL\nPolicy seed is read from stdin only; legacy restoration uses public bytes only.";
     let quota = |s: &str| -> Result<Option<u64>, String> {
         if s == "none" {
             Ok(None)
@@ -139,6 +139,24 @@ fn run() -> Result<(), String> {
         .as_slice()
     {
         ["sign", draft, output, q] => sign(Path::new(draft), Path::new(output), quota(q)?),
+        ["retain-legacy-parameters", input, url] => {
+            let bytes = read_public(Path::new(input))?;
+            tokio::runtime::Runtime::new()
+                .map_err(|_| "Operator runtime unavailable")?
+                .block_on(async {
+                    let db = pallasync_server::db::init_db_with_url(url)
+                        .await
+                        .map_err(|_| "Legacy store unavailable")?;
+                    let result =
+                        pallasync_server::api::legacy::retain_parameters(&db, &bytes).await;
+                    db.pool.close().await;
+                    result
+                })?;
+            println!(
+                "Original public legacy parameter bytes retained; the migration client must verify input identity and provenance."
+            );
+            Ok(())
+        }
         ["verify", path, q] => {
             let key = key_from_stdin()?;
             let path = Path::new(path);

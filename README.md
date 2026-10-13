@@ -60,7 +60,15 @@ cargo test --locked --all-features
 
 ## 保存済みデータと復旧
 
-v3用の `v3_*` tablesを追加し、旧テーブルを削除・変換しません。v2形式をv3 endpointへ受け入れるalias/fallbackはありません。既存の凍結したv2データの読取り・移行には、元のv2リレーをread-onlyで保全し、§9のクライアント移行を行ってください。
+必要な追加tableを作成し、旧テーブルを自動削除・変換しません。v2形式をv3 endpointへ受け入れるalias/fallbackはありません。§0 D-02／§9に従い、保存された凍結v2 chainのparameters・devices・recordsを別の `/pallasync/v2/` 経路で読み取れます。旧版の作成・登録・書込みを拒否し、明示的な旧chain DELETEだけを旧tableへ適用します。v3 chainには作用しません。
+
+旧実装がChainParametersの元の署名を保存していなかった場合、parametersの取得は空bodyの500となります。空署名・未知の署名方式・saltの推測で補いません。元の端末／exportに原public JSONが残っていれば、DBの元のsalt・creator・admin・時刻との一致を照合して保持できます。
+
+```sh
+cargo run --locked --bin pallasync-operator -- retain-legacy-parameters ORIGINAL_CHAIN_PARAMETERS.json sqlite:/absolute/path/pallasync.sqlite
+```
+
+このコマンドはpublic bytesの保持だけを行い、旧parameter署名を認証したとは扱いません。v2.1 §4.1にその署名contextと署名者が定義されていない点は移行reportへ明示する必要があります。旧authority・署名・ciphertextを新しいv3 authorityへ流用せず、§9の明示的なclient移行で再暗号化・再署名します。
 
 健全な再起動ではlog_id、transparency_id、receipt、nonce cacheを保存します。acknowledged suffixを失ったバックアップをそのままlive DBに置き戻すことは認めません。削除台帳・公開証拠・nonce状態を独立に保全し、復旧時は台帳と突き合わせ、source履歴を `/chains/import` へstagingして、明示的なadmin署名・新しいgeneration/epoch・完全snapshotによるre-seedを行います（§17.2–§17.5）。sourceの署名だけでは歴史的acceptanceを捏造できません。保持されたLogEntryと一致しないrepairは `REPAIR_PROOF_REQUIRED` とします。
 

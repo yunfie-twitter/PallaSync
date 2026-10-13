@@ -5,6 +5,7 @@ pub mod domain;
 pub mod error;
 pub mod export;
 pub mod import;
+pub mod legacy;
 pub mod mutation;
 pub mod read;
 pub mod retention;
