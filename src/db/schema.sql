@@ -59,6 +59,8 @@ CREATE TABLE IF NOT EXISTS v3_delete_versions (chain_id TEXT NOT NULL,receipt_ha
 CREATE TABLE IF NOT EXISTS v3_restart_barrier (id INTEGER PRIMARY KEY CHECK(id=1),barrier_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS v3_notices (chain_id TEXT PRIMARY KEY,notice TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS v3_operator (id INTEGER PRIMARY KEY CHECK(id=1), origin TEXT NOT NULL, relay_key_id TEXT NOT NULL, revision INTEGER NOT NULL, disclosure_hash TEXT NOT NULL);
+-- Original public legacy bytes only. Never synthesize discarded parameter signatures.
+CREATE TABLE IF NOT EXISTS v2_parameter_evidence (chain_id TEXT PRIMARY KEY, signed_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS v3_registry_history (id INTEGER PRIMARY KEY AUTOINCREMENT,chain_id TEXT NOT NULL,device_id TEXT NOT NULL,status TEXT NOT NULL,enrolled_seq INTEGER NOT NULL,revoked_seq INTEGER);
 CREATE TRIGGER IF NOT EXISTS v3_registry_insert AFTER INSERT ON v3_registry BEGIN INSERT INTO v3_registry_history(chain_id,device_id,status,enrolled_seq,revoked_seq) VALUES(new.chain_id,new.device_id,new.status,new.enrolled_seq,new.revoked_seq); END;
 CREATE TRIGGER IF NOT EXISTS v3_registry_update AFTER UPDATE ON v3_registry BEGIN INSERT INTO v3_registry_history(chain_id,device_id,status,enrolled_seq,revoked_seq) VALUES(new.chain_id,new.device_id,new.status,new.enrolled_seq,new.revoked_seq); END;

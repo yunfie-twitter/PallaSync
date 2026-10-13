@@ -565,8 +565,24 @@ async fn raw_binding_freshness_replay_and_error_profile() {
     );
     assert!(wire::canonical_query("x=1&%78=2").is_err());
     assert!(wire::canonical_query("x=%ZZ").is_err());
-    let (s, _) = c.request("GET", "/pallasync/v2/health", None, false).await;
-    assert_eq!(s, 404);
+    let legacy = c
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/pallasync/v2/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), 200);
+    assert!(!legacy.headers().contains_key("x-pallasync-protocol"));
+    let legacy_body = to_bytes(legacy.into_body(), 1024).await.unwrap();
+    assert_eq!(
+        jcs::parse(&legacy_body).unwrap(),
+        json!({"status":"ok","protocol_version":"2.1"})
+    );
     let (s, v) = c.request("PATCH", &path, Some(&json!({})), false).await;
     assert_eq!(s, 405);
     assert_eq!(v["code"], "METHOD_NOT_ALLOWED");
@@ -618,6 +634,70 @@ async fn records_partial_results_immutable_receipts_and_nonce_reuse() {
         .request("GET", &c.path("transparency/head"), None, true)
         .await;
     assert_eq!(head["head"]["entry_index"], 9);
+    c.close().await;
+}
+
+#[tokio::test]
+async fn local_recovery_artifacts_in_public_extensions_are_rejected_without_storage() {
+    let c = Context::new().await;
+    let before = c.create().await;
+    let mut records = Vec::new();
+    for kind in [
+        "PALLASYNC-RECOVERY-BLOB-v3",
+        "PALLASYNC-RECOVERY-SET-v3",
+        "PALLASYNC-RECOVERY-STATUS-v3",
+        "PALLASYNC-RECOVERY-SHARE-v3",
+        "PALLASYNC-RECOVERY-PACKAGE-v3",
+        "PALLASYNC-OFFLINE-SHARE-KEY-v3",
+        "PALLASYNC-RECOVERY-SESSION-v3",
+        "PALLASYNC-RECOVERY-TRANSFER-v3",
+    ] {
+        let mut item = record(0);
+        item["ext"] = json!({"org.palleria.fixture":{"nested":[{"type":kind}]}});
+        records.push(sign(item, &key(2), CTX_SYNC_RECORD));
+    }
+    let mut root_input = record(0);
+    root_input["ext"] =
+        json!({"org.palleria.fixture":{"mnemonic":"public fixture only","passphrase":""}});
+    records.push(sign(root_input, &key(2), CTX_SYNC_RECORD));
+    let forbidden = records.clone();
+    let mut allowed = record(0);
+    allowed["ext"] = json!({"org.palleria.fixture":{"text":"PSR3:debug","type":"example"}});
+    allowed = sign(allowed, &key(2), CTX_SYNC_RECORD);
+    records.push(allowed.clone());
+    let (status, response) = c
+        .request(
+            "POST",
+            &c.path("records"),
+            Some(&json!({"records":records})),
+            true,
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(response["accepted"].as_array().unwrap().len(), 1);
+    assert_eq!(response["accepted"][0]["record_id"], allowed["record_id"]);
+    assert_eq!(response["rejected"].as_array().unwrap().len(), 9);
+    assert!(
+        response["rejected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["code"] == "INVALID_FIELD")
+    );
+    assert_eq!(
+        response["head_seq"].as_u64().unwrap(),
+        before["head_seq"].as_u64().unwrap() + 1
+    );
+    for item in forbidden {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM v3_objects WHERE chain_id=? AND object_id=?")
+                .bind(CHAIN)
+                .bind(wire::s(&item, "record_id"))
+                .fetch_one(&c.state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+    }
     c.close().await;
 }
 
@@ -1602,5 +1682,261 @@ async fn over_quota_enrollment_request_rolls_back_candidate_but_keeps_rate_accou
             .await
             .unwrap();
     assert_eq!(rates, 1);
+    c.close().await;
+}
+
+fn legacy_token(path: &str, nonce: u8) -> Value {
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    sign(
+        json!({"v":1,"chain_id":CHAIN,"device_id":DEVICE,"method":"GET","path":path,"query":query,
+        "body_sha256":hash_bytes(b""),"issued_at_ms":now(),"expires_at_ms":now()+300000,
+        "nonce":b([nonce;16])}),
+        &key(2),
+        b"PALLASYNC-CAPABILITY-v2.1\0",
+    )
+}
+
+#[tokio::test]
+async fn frozen_legacy_pages_obey_operator_byte_limits_without_skipping_archived_rows() {
+    let mut cfg = config(None);
+    cfg.privacy["limits"]["max_request_bytes"] = 8192.into();
+    sign_relay(&key(160), &mut cfg.privacy, CTX_PRIVACY).unwrap();
+    let cfg = RelayConfig::new(key(160), (*cfg.markdown).clone(), cfg.privacy, None).unwrap();
+    let c = Context::configured(cfg).await;
+    frozen_fixture(&c).await;
+    let mut after = 0;
+    let mut pages = 0;
+    loop {
+        let path = format!("/pallasync/v2/chains/{CHAIN}/records?after_seq={after}&limit=200");
+        pages += 1;
+        let (status, _, bytes) =
+            legacy_request(&c.router, "GET", &path, Some(&legacy_token(&path, pages))).await;
+        assert_eq!(status, 200);
+        assert!(bytes.len() <= 8192);
+        let value = jcs::parse(&bytes).unwrap();
+        let records = value["records"].as_array().unwrap();
+        assert!(!records.is_empty());
+        for record in records {
+            after += 1;
+            assert_eq!(record["server_sequence"], after);
+        }
+        if value["next_cursor"].is_null() {
+            break;
+        }
+    }
+    assert_eq!(after, 201);
+    assert!(pages > 1);
+    sqlx::query("UPDATE sync_records SET encrypted_payload=? WHERE server_sequence=1")
+        .bind("A".repeat(9000))
+        .execute(&c.state.db.pool)
+        .await
+        .unwrap();
+    let path = format!("/pallasync/v2/chains/{CHAIN}/records?after_seq=0&limit=1");
+    assert_eq!(
+        legacy_request(&c.router, "GET", &path, Some(&legacy_token(&path, 99)))
+            .await
+            .0,
+        413
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_records")
+        .fetch_one(&c.state.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 201);
+    c.close().await;
+}
+
+async fn legacy_request(
+    router: &axum::Router,
+    method: &str,
+    path: &str,
+    token: Option<&Value>,
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder().method(method).uri(path);
+    if let Some(token) = token {
+        req = req.header(
+            "authorization",
+            format!("PallaSync {}", b(jcs::canonicalize_json(token).unwrap())),
+        );
+    }
+    let out = router
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let (parts, body) = out.into_parts();
+    let body = to_bytes(body, 8 * 1024 * 1024).await.unwrap().to_vec();
+    assert_eq!(parts.headers["cache-control"], "no-store");
+    assert!(parts.headers.contains_key("date"));
+    assert!(!parts.headers.contains_key("x-pallasync-protocol"));
+    (parts.status, parts.headers, body)
+}
+
+async fn frozen_fixture(c: &Context) {
+    sqlx::raw_sql(include_str!("fixtures/frozen-v2-schema.sql"))
+        .execute(&c.state.db.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO chains(chain_id,chain_salt,admin_public_key,created_at_ms,creator_device_id,creator_public_key) VALUES(?,?,?,0,?,?)")
+        .bind(CHAIN).bind(b([9;32])).bind(b(key(1).verifying_key().as_bytes())).bind(DEVICE).bind(b(key(2).verifying_key().as_bytes())).execute(&c.state.db.pool).await.unwrap();
+    sqlx::query("INSERT INTO devices(chain_id,device_id,device_public_key,encrypted_device_name,device_name_nonce,status,created_at_ms,updated_at_ms,signature) VALUES(?,?,?,?,?,'active',0,0,?)")
+        .bind(CHAIN).bind(DEVICE).bind(b(key(2).verifying_key().as_bytes())).bind(b([4;80])).bind(b([5;24])).bind(b([6;64])).execute(&c.state.db.pool).await.unwrap();
+    let mut tx = c.state.db.pool.begin().await.unwrap();
+    for index in 1..=201 {
+        // Opaque archived ciphertext. This test does not claim legacy AEAD/provenance validation.
+        sqlx::query("INSERT INTO sync_records(chain_id,record_id,protocol_version,epoch,collection_name,action,encrypted_payload,payload_nonce,device_id,lamport,created_at_ms,signature) VALUES(?,?,'2.1',0,'palleria.search_history/2','upsert',?,?,?,1,0,?)")
+            .bind(CHAIN).bind(format!("01990000-0000-7000-8000-{index:012x}")).bind(b([7;80])).bind(b([8;24])).bind(DEVICE).bind(b([9;64])).execute(&mut *tx).await.unwrap();
+    }
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn frozen_legacy_is_bounded_context_separated_and_preserves_nonce_on_restart() {
+    let c = Context::with_quota(None).await;
+    frozen_fixture(&c).await;
+    let path = format!("/pallasync/v2/chains/{CHAIN}/records?after_seq=0&limit=200");
+    let token = legacy_token(&path, 41);
+    let (status, headers, bytes) = legacy_request(&c.router, "GET", &path, Some(&token)).await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["pallasync-next-seq"], "200");
+    assert_eq!(headers["pallasync-has-more"], "true");
+    let first = jcs::parse(&bytes).unwrap();
+    assert_eq!(first["records"].as_array().unwrap().len(), 200);
+    assert_eq!(first["next_cursor"], "200");
+    assert_eq!(first["records"][0]["protocol_version"], "2.1");
+    assert_eq!(first["records"][0]["encrypted_payload"], b([7; 80]));
+    let second_path = format!("/pallasync/v2/chains/{CHAIN}/records?cursor=200&limit=200");
+    let (status, headers, bytes) = legacy_request(
+        &c.router,
+        "GET",
+        &second_path,
+        Some(&legacy_token(&second_path, 42)),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(headers["pallasync-has-more"], "false");
+    assert_eq!(
+        jcs::parse(&bytes).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let wrong = sign(token.clone(), &key(2), CTX_CAPABILITY);
+    assert_eq!(
+        legacy_request(&c.router, "GET", &path, Some(&wrong))
+            .await
+            .0,
+        401
+    );
+    assert_eq!(legacy_request(&c.router, "POST", &path, None).await.0, 405);
+    let query_changed = format!("/pallasync/v2/chains/{CHAIN}/records?after_seq=1&limit=200");
+    assert_eq!(
+        legacy_request(&c.router, "GET", &query_changed, Some(&token))
+            .await
+            .0,
+        401
+    );
+    let cfg = (*c.state.config).clone();
+    c.state.db.pool.close().await;
+    let db = db::init_db_with_url(&format!(
+        "sqlite:{}",
+        c.path.to_string_lossy().replace('\\', "/")
+    ))
+    .await
+    .unwrap();
+    let restarted = AppState::new(db, cfg).await.unwrap();
+    let router = app(restarted.clone());
+    assert_eq!(
+        legacy_request(&router, "GET", &path, Some(&token)).await.0,
+        401
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_records")
+        .fetch_one(&restarted.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 201);
+    restarted.db.pool.close().await;
+    c.close().await;
+}
+
+#[tokio::test]
+async fn missing_legacy_parameters_are_not_fabricated_and_explicit_legacy_delete_cannot_delete_v3()
+{
+    let c = Context::with_quota(None).await;
+    c.create().await;
+    frozen_fixture(&c).await;
+    let parameters = format!("/pallasync/v2/chains/{CHAIN}/parameters");
+    let (status, _, body) = legacy_request(&c.router, "GET", &parameters, None).await;
+    assert_eq!(status, 500);
+    assert!(body.is_empty());
+    // Archive/return original public input only; its undefined legacy signature context
+    // is not certified by this storage test or reused as v3 authority.
+    let original = json!({"protocol_version":"2.1","chain_id":CHAIN,"chain_salt":b([9;32]),"created_at_ms":0,
+        "creator_device_id":DEVICE,"creator_public_key":b(key(2).verifying_key().as_bytes()),
+        "admin_public_key":b(key(1).verifying_key().as_bytes()),"signature":b([10;64])});
+    pallasync_server::api::legacy::retain_parameters(
+        &c.state.db,
+        &jcs::canonicalize_json(&original).unwrap(),
+    )
+    .await
+    .unwrap();
+    pallasync_server::api::legacy::retain_parameters(
+        &c.state.db,
+        &serde_json::to_vec_pretty(&original).unwrap(),
+    )
+    .await
+    .unwrap();
+    let (status, _, body) = legacy_request(&c.router, "GET", &parameters, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(jcs::parse(&body).unwrap(), original);
+    let mut mismatch = original.clone();
+    mismatch["chain_salt"] = b([8; 32]).into();
+    assert!(
+        pallasync_server::api::legacy::retain_parameters(
+            &c.state.db,
+            &jcs::canonicalize_json(&mismatch).unwrap()
+        )
+        .await
+        .is_err()
+    );
+    mismatch = original.clone();
+    mismatch["signature"] = b([11; 64]).into();
+    assert!(
+        pallasync_server::api::legacy::retain_parameters(
+            &c.state.db,
+            &jcs::canonicalize_json(&mismatch).unwrap()
+        )
+        .await
+        .is_err()
+    );
+    let path = format!("/pallasync/v2/chains/{CHAIN}");
+    let mut token = legacy_token(&path, 43);
+    token["method"] = "DELETE".into();
+    token = sign(token, &key(2), b"PALLASYNC-CAPABILITY-v2.1\0");
+    assert_eq!(
+        legacy_request(&c.router, "DELETE", &path, Some(&token))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(
+        legacy_request(&c.router, "GET", &parameters, None).await.0,
+        410
+    );
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_records")
+        .fetch_one(&c.state.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0);
+    let modern: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM v3_chains")
+        .fetch_one(&c.state.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(modern, 1);
+    assert_eq!(
+        c.request("GET", &c.path("log/head"), None, true).await.0,
+        200
+    );
     c.close().await;
 }

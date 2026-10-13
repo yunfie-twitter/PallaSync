@@ -197,6 +197,9 @@ fn endpoint(path: &str, method: &str) -> Result<Endpoint> {
     })
 }
 pub async fn handle(State(state): State<AppState>, request: Request<Body>) -> Response<Body> {
+    if super::legacy::is_legacy(request.uri().path()) {
+        return super::legacy::handle(&state, request).await;
+    }
     let mut transfer_permit = None;
     let uri = request.uri().clone();
     let method = request.method().clone();

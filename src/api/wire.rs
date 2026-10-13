@@ -63,6 +63,7 @@ pub fn fields(v: &Value, required: &[(&str, &str)], optional: &[(&str, &str)]) -
     Ok(())
 }
 pub fn signed(v: &Value, required: &[(&str, &str)]) -> Result<()> {
+    reject_local_artifacts(v)?;
     let mut required = required.to_vec();
     required.push(("signature", "b64"));
     fields(v, &required, &[("ext", "object")])?;
@@ -89,6 +90,42 @@ pub fn signed(v: &Value, required: &[(&str, &str)]) -> Result<()> {
             {
                 return Err(err("INVALID_FIELD"));
             }
+        }
+    }
+    Ok(())
+}
+// §§5.5/7.11: ordinary public extensions cannot carry reserved local recovery objects.
+// This validates public JSON structure only; encrypted fields remain opaque.
+fn reject_local_artifacts(v: &Value) -> Result<()> {
+    let mut pending = vec![v];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(object) => {
+                let artifact = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        matches!(
+                            kind,
+                            "PALLASYNC-RECOVERY-BLOB-v3"
+                                | "PALLASYNC-RECOVERY-SET-v3"
+                                | "PALLASYNC-RECOVERY-STATUS-v3"
+                                | "PALLASYNC-RECOVERY-SHARE-v3"
+                                | "PALLASYNC-RECOVERY-PACKAGE-v3"
+                                | "PALLASYNC-OFFLINE-SHARE-KEY-v3"
+                                | "PALLASYNC-RECOVERY-SESSION-v3"
+                                | "PALLASYNC-RECOVERY-TRANSFER-v3"
+                        )
+                    });
+                if artifact
+                    || (object.contains_key("mnemonic") && object.contains_key("passphrase"))
+                {
+                    return Err(err("INVALID_FIELD"));
+                }
+                pending.extend(object.values());
+            }
+            Value::Array(values) => pending.extend(values),
+            _ => {}
         }
     }
     Ok(())
