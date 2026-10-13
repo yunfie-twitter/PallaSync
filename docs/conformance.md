@@ -53,3 +53,5 @@ acknowledged suffix lossからの復旧は、削除台帳・nonce状態・source
 §8.6の復旧監査をPython参照clientで独立に検査するよう追加しました（tests/reference/recovery_audit.py、test_recovery_audit.py）。公開メタデータ以外のfield、holder ID、誤ったt/n/count、whole-set／ceremonyの非null holder_kindを拒否します。全25 reference unit試験は1.003秒で成功しました。署名／AEAD roundtripは参照client内の試験で、Androidを含む三者ITの完了ではありません。relay runtimeへ復号／schema解釈を追加していません。
 
 2026-10-13の再検証ではserverの全26試験、fmt／clippy／bins build、独立Python／隔離HTTPS relayのepoch・CAS・atomic失効、peer承認、凍結legacy／nonce／旧版削除、Docker設定生成が通過しました（target/qualification-*.log）。Androidの全機能、全50 IT、production更新は完了していません。
+
+同日、再生成client APKと隔離relayで `run_android_interop.py --rotate-epoch --peer-enrollment` を再実行し190.27秒で成功しました（`target/qualification-android-resume-interop.log`）。Android由来の暗号化record・同期・epoch・peer承認証拠を、Python参照clientが独立に検証します。この対象試験はAppendix Bの完全な認証、Android recovery lifecycle全件、IT-01〜IT-50を意味しません。
