@@ -109,3 +109,5 @@ processing for future Android interoperability. It caches encrypted transfers an
 never decrypted payloads. It validates payload schemas and literal §19 result codes, aborts invalid
 sessions and preserves only an authenticated sequence gap for retry. Callers validate known set status and holder/root
 authorization; unit crypto success does not certify the full recovery state machine or UI.
+
+`run_android_interop.py --delete-chain --delete-response-lost` commits an admin DELETE on the isolated relay and closes only that request's HTTP response. Android must retain its chain while proof is unavailable, then reuse its exact saved signed request after retry backoff, verify GET `/deletion`, and erase only after proof/bundle readback and explicit confirmation. The disposable AVD run passed in 133.415 seconds; physical SAF and the broader deletion fault catalogue remain outside this case.

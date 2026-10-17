@@ -24,11 +24,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class IsolatedRelay:
-    def __init__(self, binary, chain_delay=0):
+    def __init__(self, binary, chain_delay=0, drop_delete_response=False):
         self.binary = Path(binary).resolve()
         self.temporary = tempfile.TemporaryDirectory(prefix="pallasync-reference-")
         self.directory = Path(self.temporary.name)
         self.process = None
+        self.drop_delete_response = drop_delete_response
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
         reserve = socket.socket()
         reserve.bind(("127.0.0.1",0))
@@ -55,6 +56,12 @@ class IsolatedRelay:
                 connection.request(self.command,self.path,body,headers)
                 response = connection.getresponse()
                 payload = response.read(8_388_609)
+                if (harness.drop_delete_response and self.command == "DELETE"
+                        and self.path.startswith("/pallasync/v3/chains/") and self.path.count("/") == 4):
+                    harness.drop_delete_response = False
+                    connection.close()
+                    self.close_connection = True
+                    return
                 self.send_response(response.status)
                 for name,value in response.getheaders():
                     if name.lower() not in {"transfer-encoding","connection","content-length","date","server"}:

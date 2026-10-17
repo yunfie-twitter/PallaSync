@@ -30,7 +30,9 @@ def run(args):
             raise RuntimeError("APK installation did not succeed")
     client = CryptoClient(" ".join(["abandon"]*23+["art"]))
     schema = strict_loads((ROOT/"docs/privacy.schema.json").read_bytes())
-    with IsolatedRelay(args.relay_binary,chain_delay=1.5) as relay:
+    if args.delete_response_lost and not args.delete_chain:
+        raise ValueError("--delete-response-lost requires --delete-chain")
+    with IsolatedRelay(args.relay_binary,chain_delay=1.5,drop_delete_response=args.delete_response_lost) as relay:
         http = ReferenceHTTP(relay,client,True,schema)
         genesis = client.genesis()
         status,created,_ = http.request("POST","/pallasync/v3/chains",genesis,True)
@@ -54,7 +56,8 @@ def run(args):
                 "-e","relay_ca_base64",base64.b64encode((relay.directory/"tls.pem").read_bytes()).decode(),
                 "-e","rotate_epoch","true" if args.rotate_epoch else "false",
                 "-e","replace_device","true" if args.replace_device else "false",
-                "-e","delete_chain","true" if args.delete_chain else "false"]
+                "-e","delete_chain","true" if args.delete_chain else "false",
+                "-e","delete_response_lost","true" if args.delete_response_lost else "false"]
             if args.rebase_fault:
                 command.extend(["-e","rebase_fault",args.rebase_fault])
             if handoff is not None:
@@ -96,7 +99,8 @@ def run(args):
             assert ledger["chain_id"] == client.chain and ledger["deletion_id"] == receipt["deletion_id"]
             pin.signed(entry,b"PALLASYNC-TRANSPARENCY-ENTRY-v3\0")
             assert entry["operation"] == "delete" and entry["entry_index"] == receipt["transparency_index"]
-            print("PASS: Android GET /deletion proof, local signed-proof/bundle file readback and post-confirmation erasure; Python independently verified relay receipt, deletion ledger and transparency signature",flush=True)
+            outcome = "after a deliberately lost DELETE response" if args.delete_response_lost else "after a confirmed DELETE response"
+            print(f"PASS: Android GET /deletion proof {outcome}, local signed-proof/bundle file readback and post-confirmation erasure; Python independently verified relay receipt, deletion ledger and transparency signature",flush=True)
             return
         match = re.search(r"pallasync_device_id=([0-9a-f-]{36})",output)
         if match is None:
@@ -188,5 +192,6 @@ if __name__ == "__main__":
     parser.add_argument("--replace-device",action="store_true")
     parser.add_argument("--peer-enrollment",action="store_true")
     parser.add_argument("--delete-chain",action="store_true")
+    parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--rebase-fault",choices=["SOURCE_STAGED","DESTINATION_COMMITTED","SOURCE_RETIRED"])
     run(parser.parse_args())
