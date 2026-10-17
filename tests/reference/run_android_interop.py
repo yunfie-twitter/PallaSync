@@ -51,7 +51,8 @@ def run(args):
             command = ["shell","am","instrument","-w","-r","-e","class",
                 "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
                 "-e","relay_ca_base64",base64.b64encode((relay.directory/"tls.pem").read_bytes()).decode(),
-                "-e","rotate_epoch","true" if args.rotate_epoch else "false"]
+                "-e","rotate_epoch","true" if args.rotate_epoch else "false",
+                "-e","replace_device","true" if args.replace_device else "false"]
             if args.rebase_fault:
                 command.extend(["-e","rebase_fault",args.rebase_fault])
             if handoff is not None:
@@ -88,26 +89,46 @@ def run(args):
         device = item["device_record"]
         verify(device,base64.urlsafe_b64decode(device["device_public_key"]+"="),b"PALLASYNC-DEVICE-RECORD-v3\0")
         verify(device["enrollment"],bytes(client.admin.verify_key),b"PALLASYNC-ENROLLMENT-v3\0")
+        android_ids = {subject}
+        old_android_device = None
+        devices_by_id = {entry["device_record"]["device_id"]: entry for entry in registry["items"]}
+        if args.replace_device:
+            old_match = re.search(r"pallasync_replaced_old_device=([0-9a-f-]{36})",output)
+            if old_match is None:
+                raise RuntimeError("No old Android identity was reported for replacement")
+            old_android_device = old_match.group(1)
+            old_item = devices_by_id[old_android_device]
+            assert old_item["status"] == "revoked",old_item
+            android_ids.add(old_android_device)
         keys_by_epoch = {0: client.keys}
-        if args.rotate_epoch:
+        if args.rotate_epoch or args.replace_device:
             from android_epoch import verify_android_epoch
             members = [client.device_id,device["device_id"]] + ([handoff.subject.device_id] if handoff is not None else [])
-            keys_by_epoch[1] = verify_android_epoch(http,client,genesis,created,device,bytes(relay.relay_key.verify_key),members)
+            if args.replace_device:
+                keys_by_epoch[1] = verify_android_epoch(
+                    http,client,genesis,created,device,bytes(relay.relay_key.verify_key),members,
+                    reason="key_rotation",admin=True,revoked=[old_android_device])
+            else:
+                keys_by_epoch[1] = verify_android_epoch(http,client,genesis,created,device,bytes(relay.relay_key.verify_key),members)
         cursor,found,initial_found,rotated_found = None,False,False,False
         android_records = []
         paused_records = []
+        replacement_records = []
         while True:
             path = prefix+"/records?limit=200"+("&cursor="+cursor if cursor else "")
             status,page,_ = http.request("GET",path)
             assert status == 200,page
             for entry in page["items"]:
                 record = entry["object"]
-                if record["device_id"] != subject: continue
+                if record["device_id"] not in android_ids: continue
                 client.keys = keys_by_epoch[record["epoch"]]
-                inner = client.decrypt(record,base64.urlsafe_b64decode(device["device_public_key"]+"="))
+                record_device = devices_by_id[record["device_id"]]["device_record"]
+                inner = client.decrypt(record,base64.urlsafe_b64decode(record_device["device_public_key"]+"="))
                 android_records.append((record, inner))
                 if any(op["body"].get("query") == "Android paused interop" for op in inner["operations"]):
                     paused_records.append((record, inner))
+                if any(op["body"].get("query") == "Replacement pending" for op in inner["operations"]):
+                    replacement_records.append((record, inner))
                 found |= any(op["body"].get("query") == "Android interop" for op in inner["operations"])
                 rotated_found |= record["epoch"] == 1 and any(op["body"].get("query") == "Android rotated interop" for op in inner["operations"])
                 for op in inner["operations"]:
@@ -122,14 +143,22 @@ def run(args):
         assert initial_found,"The independent receiver did not decrypt the preserved initial local intent"
         assert len(paused_records) == 1,"A paused editing intent was lost or signed twice"
         assert paused_records[0][0]["epoch"] == 0 and paused_records[0][1]["device_seq"] == 2
+        if args.replace_device:
+            assert len(replacement_records) == 1,"Replacement did not replay the unaccepted intent exactly once"
+            assert replacement_records[0][0]["device_id"] == subject and replacement_records[0][0]["epoch"] == 1
+            assert replacement_records[0][1]["device_seq"] == 1,"Fresh device author sequence did not start at one"
         print("PASS: actual Android disabled edit/projection preview, native session close/journal reopen and explicit same-identity resume; Python independently verified one exact accepted operation",flush=True)
-        if args.rotate_epoch:
+        if args.rotate_epoch and not args.replace_device:
             assert rotated_found,"The independent receiver did not decrypt the post-ack Android epoch-one record"
             source_match = re.search(r"pallasync_rebase_sources=(\[[^\r\n]+\])",output)
             assert source_match is not None,"No public abandoned source ciphertext was reported"
             from android_rebase import verify_android_rebase
             verify_android_rebase(client,strict_loads(source_match.group(1).encode()),android_records,keys_by_epoch,base64.urlsafe_b64decode(device["device_public_key"]+"="))
+        if args.replace_device:
+            assert rotated_found,"The independent receiver did not decrypt the replacement identity's epoch-one record"
         print("PASS: actual Android coordinator enrollment/initial sync/outbox -> isolated relay -> independent Python signature/AEAD receiver",flush=True)
+        if args.replace_device:
+            print("PASS: Android fresh-key replacement registered/read back/acked a new identity, committed admin key_rotation revoking the old ID, and Python independently verified the epoch and exactly-once reauthored intent",flush=True)
 
 
 if __name__ == "__main__":
@@ -137,6 +166,7 @@ if __name__ == "__main__":
     for name in ("adb","relay-binary","app-apk","test-apk"):
         parser.add_argument("--"+name,required=True)
     parser.add_argument("--rotate-epoch",action="store_true")
+    parser.add_argument("--replace-device",action="store_true")
     parser.add_argument("--peer-enrollment",action="store_true")
     parser.add_argument("--rebase-fault",choices=["SOURCE_STAGED","DESTINATION_COMMITTED","SOURCE_RETIRED"])
     run(parser.parse_args())

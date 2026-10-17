@@ -9,18 +9,19 @@ from epoch_interop import envelope_secret
 from attestations import Pin, data_zero, data_link, receipt, transparency_zero, transparency_link
 
 
-def verify_android_epoch(http, client, genesis, created, device, relay_key, expected_members=None):
+def verify_android_epoch(http, client, genesis, created, device, relay_key, expected_members=None,
+                         reason="manual", admin=False, revoked=()):
     prefix = "/pallasync/v3/chains/" + client.chain
     status, item, _ = http.request("GET", prefix + "/epochs/1", admin=True)
     assert status == 200, item
     epoch = item["epoch"]
-    signer = decode(device["device_public_key"], 32)
+    signer = bytes(client.admin.verify_key) if admin else decode(device["device_public_key"], 32)
     verify(epoch, signer, b"PALLASYNC-EPOCH-v3\0")
     assert (epoch["chain_id"] == client.chain and epoch["generation"] == 0 and epoch["epoch"] == 1
             and epoch["previous_epoch_hash"] == object_hash(genesis["epoch"])
-            and epoch["reason"] == "manual" and epoch["signer_kind"] == "device"
-            and epoch["signer_device_id"] == device["device_id"]
-            and epoch["revoked_device_ids"] == []
+            and epoch["reason"] == reason and epoch["signer_kind"] == ("admin" if admin else "device")
+            and epoch["signer_device_id"] == (None if admin else device["device_id"])
+            and epoch["revoked_device_ids"] == sorted(revoked)
             and epoch["members"] == sorted(expected_members or [client.device_id, device["device_id"]]))
     assert item["epoch_hash"] == object_hash(epoch)
     status, page, _ = http.request("GET", prefix + "/devices/" + client.device_id + "/envelopes?epoch=1&limit=200", admin=True)
