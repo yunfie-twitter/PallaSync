@@ -178,6 +178,62 @@ pub async fn stage(
         verify(comp, s(&d, "device_public_key"), CTX_COMPACTION)?;
         store::put_object(&mut *db, chain, "compaction", comp, None).await?;
     }
+    let staged_parameters = sqlx::query_scalar::<_, String>(
+        "SELECT body FROM v3_objects WHERE chain_id=? AND kind='parameters' AND log_id IS NULL",
+    )
+    .bind(chain)
+    .fetch_all(&mut *db)
+    .await?;
+    for body in staged_parameters {
+        let parameters = store::value(body);
+        if n(&parameters, "generation") > 0 {
+            let previous = store::object(
+                &mut *db,
+                chain,
+                "parameters",
+                &(n(&parameters, "generation") - 1).to_string(),
+            )
+            .await?;
+            if previous.as_ref().is_some_and(|previous| {
+                s(&parameters, "previous_parameters_hash") != object_hash(previous)
+            }) {
+                return Err(err("IMPORT_CONFLICT"));
+            }
+        }
+    }
+    let staged_epochs = sqlx::query_scalar::<_, String>(
+        "SELECT body FROM v3_objects WHERE chain_id=? AND kind='epoch' AND log_id IS NULL",
+    )
+    .bind(chain)
+    .fetch_all(&mut *db)
+    .await?;
+    for body in staged_epochs {
+        let epoch = store::value(body);
+        if n(&epoch, "epoch") > 0 {
+            let previous = store::object(
+                &mut *db,
+                chain,
+                "epoch",
+                &(n(&epoch, "epoch") - 1).to_string(),
+            )
+            .await?;
+            if previous
+                .as_ref()
+                .is_some_and(|previous| s(&epoch, "previous_epoch_hash") != object_hash(previous))
+            {
+                return Err(err("EPOCH_CHAIN_INVALID"));
+            }
+        }
+        for member in a(&epoch, "members") {
+            let device = store::object(&mut *db, chain, "device", member.as_str().unwrap()).await?;
+            if device
+                .as_ref()
+                .is_some_and(|device| n(device, "generation") != n(&epoch, "generation"))
+            {
+                return Err(err("IMPORT_CONFLICT"));
+            }
+        }
+    }
     let staged: Option<String> =
         sqlx::query_scalar("SELECT log_id FROM v3_imports WHERE chain_id=?")
             .bind(chain)

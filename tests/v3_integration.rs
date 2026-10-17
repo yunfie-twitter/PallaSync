@@ -1343,7 +1343,7 @@ async fn import_accepts_consecutive_history_chunks_with_a_fixed_terminal_head() 
     });
 
     let mut first = other.clone();
-    first["parameters_history"] = json!([p0, p2.clone()]);
+    first["parameters_history"] = json!([p0.clone(), p2.clone()]);
     let (status, staged_first) = target
         .request("POST", "/pallasync/v3/chains/import", Some(&first), false)
         .await;
@@ -1357,6 +1357,48 @@ async fn import_accepts_consecutive_history_chunks_with_a_fixed_terminal_head() 
     assert_eq!(status, 202, "{staged_second}");
     assert_eq!(staged_first["log_id"], staged_second["log_id"]);
     target.close().await;
+
+    let mut bad_privacy = base.privacy.clone();
+    bad_privacy["relay_origin"] = "https://target.example.com".into();
+    bad_privacy["relay_key_id"] = hash_bytes(key(161).verifying_key().as_bytes()).into();
+    sign_relay(&key(161), &mut bad_privacy, CTX_PRIVACY).unwrap();
+    let bad_target = Context::configured(
+        RelayConfig::new(key(161), (*base.markdown).clone(), bad_privacy, None).unwrap(),
+    )
+    .await;
+    let mut invalid_head = p1.clone();
+    invalid_head["generation"] = 2.into();
+    invalid_head["previous_parameters_hash"] = object_hash(&p0).into();
+    let invalid_head = sign(invalid_head, &key(1), CTX_PARAMETERS);
+    let mut invalid_first = json!({
+        "parameters_history": [p0, invalid_head.clone()],
+        "epoch_history": [source.genesis["epoch"]],
+        "device_history": [source.genesis["device_record"]],
+        "envelopes": source.genesis["envelopes"],
+        "compactions": [],
+    });
+    let (status, _) = bad_target
+        .request(
+            "POST",
+            "/pallasync/v3/chains/import",
+            Some(&invalid_first),
+            false,
+        )
+        .await;
+    assert_eq!(status, 202);
+    invalid_first["parameters_history"] = json!([p1, invalid_head]);
+    let (status, response) = bad_target
+        .request(
+            "POST",
+            "/pallasync/v3/chains/import",
+            Some(&invalid_first),
+            false,
+        )
+        .await;
+    assert_eq!(status, 409, "{response}");
+    assert_eq!(response["code"], "IMPORT_CONFLICT");
+    bad_target.close().await;
+    source.close().await;
 }
 
 #[tokio::test]
