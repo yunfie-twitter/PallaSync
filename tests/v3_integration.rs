@@ -1312,6 +1312,54 @@ async fn import_reseed_installs_fresh_pending_members_and_preserves_source_autho
 }
 
 #[tokio::test]
+async fn import_accepts_consecutive_history_chunks_with_a_fixed_terminal_head() {
+    let source = Context::new().await;
+    source.create().await;
+    let base = config(None);
+    let mut privacy = base.privacy.clone();
+    privacy["relay_origin"] = "https://target.example.com".into();
+    privacy["relay_key_id"] = hash_bytes(key(161).verifying_key().as_bytes()).into();
+    sign_relay(&key(161), &mut privacy, CTX_PRIVACY).unwrap();
+    let target = Context::configured(
+        RelayConfig::new(key(161), (*base.markdown).clone(), privacy, None).unwrap(),
+    )
+    .await;
+
+    let p0 = source.genesis["parameters"].clone();
+    let mut p1 = p0.clone();
+    p1["generation"] = 1.into();
+    p1["previous_parameters_hash"] = object_hash(&p0).into();
+    let p1 = sign(p1, &key(1), CTX_PARAMETERS);
+    let mut p2 = p1.clone();
+    p2["generation"] = 2.into();
+    p2["previous_parameters_hash"] = object_hash(&p1).into();
+    let p2 = sign(p2, &key(1), CTX_PARAMETERS);
+    let fixed_epoch = source.genesis["epoch"].clone();
+    let other = json!({
+        "epoch_history": [fixed_epoch],
+        "device_history": [source.genesis["device_record"]],
+        "envelopes": source.genesis["envelopes"],
+        "compactions": [],
+    });
+
+    let mut first = other.clone();
+    first["parameters_history"] = json!([p0, p2.clone()]);
+    let (status, staged_first) = target
+        .request("POST", "/pallasync/v3/chains/import", Some(&first), false)
+        .await;
+    assert_eq!(status, 202, "{staged_first}");
+
+    let mut second = other;
+    second["parameters_history"] = json!([p1, p2]);
+    let (status, staged_second) = target
+        .request("POST", "/pallasync/v3/chains/import", Some(&second), false)
+        .await;
+    assert_eq!(status, 202, "{staged_second}");
+    assert_eq!(staged_first["log_id"], staged_second["log_id"]);
+    target.close().await;
+}
+
+#[tokio::test]
 async fn policy_signature_schema_limits_and_restart_barrier_are_enforced() {
     let base = config(None);
     let mut invalid = base.privacy.clone();
