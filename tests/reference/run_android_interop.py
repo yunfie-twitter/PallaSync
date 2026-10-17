@@ -5,6 +5,7 @@ Only the task-owned PallaSyncV3Conformance emulator is accepted.
 """
 import argparse
 import base64
+from contextlib import ExitStack
 import re
 import subprocess
 import uuid
@@ -32,7 +33,9 @@ def run(args):
     schema = strict_loads((ROOT/"docs/privacy.schema.json").read_bytes())
     if args.delete_response_lost and not args.delete_chain:
         raise ValueError("--delete-response-lost requires --delete-chain")
-    with IsolatedRelay(args.relay_binary,chain_delay=1.5,drop_delete_response=args.delete_response_lost) as relay:
+    with ExitStack() as stack:
+        relay = stack.enter_context(IsolatedRelay(args.relay_binary,chain_delay=1.5,drop_delete_response=args.delete_response_lost))
+        target_relay = stack.enter_context(IsolatedRelay(args.relay_binary)) if args.reseed else None
         http = ReferenceHTTP(relay,client,True,schema)
         genesis = client.genesis()
         status,created,_ = http.request("POST","/pallasync/v3/chains",genesis,True)
@@ -45,19 +48,26 @@ def run(args):
         assert status == 200 and len(accepted["accepted"]) == 1,accepted
         port = relay.proxy.server_port
         adb("reverse",f"tcp:{port}",f"tcp:{port}")
+        if target_relay is not None:
+            adb("reverse",f"tcp:{target_relay.proxy.server_port}",f"tcp:{target_relay.proxy.server_port}")
         handoff = None
         if args.peer_enrollment:
             from android_peer import AndroidPeerHandoff
             handoff = AndroidPeerHandoff(args.adb,str(uuid.uuid4()),relay,client,genesis,schema,created["log_id"])
             handoff.thread.start()
         try:
+            relay_cert = (relay.directory/"tls.pem").read_bytes()
+            if target_relay is not None:
+                relay_cert += (target_relay.directory/"tls.pem").read_bytes()
             command = ["shell","am","instrument","-w","-r","-e","class",
                 "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
-                "-e","relay_ca_base64",base64.b64encode((relay.directory/"tls.pem").read_bytes()).decode(),
+                "-e","relay_ca_base64",base64.b64encode(relay_cert).decode(),
                 "-e","rotate_epoch","true" if args.rotate_epoch else "false",
                 "-e","replace_device","true" if args.replace_device else "false",
                 "-e","delete_chain","true" if args.delete_chain else "false",
                 "-e","delete_response_lost","true" if args.delete_response_lost else "false"]
+            if target_relay is not None:
+                command.extend(["-e","reseed_target_origin",target_relay.origin])
             if args.rebase_fault:
                 command.extend(["-e","rebase_fault",args.rebase_fault])
             if handoff is not None:
@@ -66,6 +76,8 @@ def run(args):
             output = adb(*command)
         finally:
             adb("reverse","--remove",f"tcp:{port}")
+            if target_relay is not None:
+                adb("reverse","--remove",f"tcp:{target_relay.proxy.server_port}")
         print(output[-6000:],flush=True)
         if not re.search(r"OK \(1 test\)",output):
             if args.delete_chain:
@@ -83,6 +95,23 @@ def run(args):
             raise RuntimeError("Actual Android integration test did not pass")
         if handoff is not None:
             handoff.finish()
+        if target_relay is not None:
+            if "pallasync_reseed_generation=1" not in output:
+                raise RuntimeError("Android did not report a completed generation+1 reseed cutover")
+            target_http = ReferenceHTTP(target_relay,client,True,schema)
+            reseed_prefix = "/pallasync/v3/chains/"+client.chain
+            status,parameters,_ = target_http.request("GET",reseed_prefix+"/parameters",admin=True)
+            assert status == 200 and parameters["generation"] == 1 and parameters["parameters"]["generation"] == 1,parameters
+            status,registry,_ = target_http.request("GET",reseed_prefix+"/devices",admin=True)
+            assert status == 200,registry
+            device_id = re.search(r"pallasync_reseed_device_id=([0-9a-f-]{36})",output)
+            assert device_id is not None
+            device = next(item["device_record"] for item in registry["items"] if item["device_record"]["device_id"] == device_id.group(1))
+            verify(device,base64.urlsafe_b64decode(device["device_public_key"]+"="),b"PALLASYNC-DEVICE-RECORD-v3\0")
+            verify(device["enrollment"],bytes(client.admin.verify_key),b"PALLASYNC-ENROLLMENT-v3\0")
+            assert any(item["status"] == "active" and item["device_record"]["device_id"] == device["device_id"] for item in registry["items"])
+            print("PASS: Android explicitly selected and consented to a second isolated relay, imported verified state, committed generation+1, validated the new relay authority, registered/read back/acked a fresh device, and switched origin; Python independently verified target parameters and device certificates",flush=True)
+            return
         assert "pallasync_local_boundary=verified" in output,"No actual Android pre-persistence recovery-artifact boundary result"
         assert "pallasync_bound_origin=verified" in output,"No actual Android bound-origin check"
         if handoff is not None:
@@ -193,5 +222,6 @@ if __name__ == "__main__":
     parser.add_argument("--peer-enrollment",action="store_true")
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
+    parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--rebase-fault",choices=["SOURCE_STAGED","DESTINATION_COMMITTED","SOURCE_RETIRED"])
     run(parser.parse_args())
