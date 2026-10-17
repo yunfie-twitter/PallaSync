@@ -10,6 +10,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from protocol import b64, object_hash, strict_loads, verify
+from attestations import Pin, ledger_hash
 from crypto_client import CryptoClient
 from http_client import ReferenceHTTP
 from isolated_relay import IsolatedRelay, ROOT
@@ -52,7 +53,8 @@ def run(args):
                 "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
                 "-e","relay_ca_base64",base64.b64encode((relay.directory/"tls.pem").read_bytes()).decode(),
                 "-e","rotate_epoch","true" if args.rotate_epoch else "false",
-                "-e","replace_device","true" if args.replace_device else "false"]
+                "-e","replace_device","true" if args.replace_device else "false",
+                "-e","delete_chain","true" if args.delete_chain else "false"]
             if args.rebase_fault:
                 command.extend(["-e","rebase_fault",args.rebase_fault])
             if handoff is not None:
@@ -63,6 +65,13 @@ def run(args):
             adb("reverse","--remove",f"tcp:{port}")
         print(output[-6000:],flush=True)
         if not re.search(r"OK \(1 test\)",output):
+            if args.delete_chain:
+                deletion_status,deletion_proof,_ = http.request("GET",prefix+"/deletion",admin=True)
+                safe_proof = {key: deletion_proof.get(key) for key in ("ledger","admin_operation","delete_receipt","deletion_transparency_entry")}
+                authorization = deletion_proof.get("device_authorization")
+                safe_proof["device_authorization"] = None if authorization is None else {"request": authorization.get("request")}
+                print("DELETE PROOF DIAGNOSTIC",deletion_status,sorted(deletion_proof.keys()),
+                      safe_proof,flush=True)
             if handoff is not None:
                 handoff.stop.set()
                 handoff.thread.join(timeout=25)
@@ -77,6 +86,18 @@ def run(args):
             assert "pallasync_peer_approval=verified" in output,"No actual Android peer approval result"
         print("PASS: actual Android JNI/Room rejected eight local artifact types, root-input shape and an encoded PSR3 package before application persistence, journal/outbox or author advancement",flush=True)
         print("PASS: actual Android rejected a different relay origin before chain transport and retained the protected origin binding",flush=True)
+        if args.delete_chain:
+            status,proof,_ = http.request("GET",prefix+"/deletion",admin=True)
+            assert status == 200 and set(proof) == {"ledger","parameters","epoch","enrollment_chain","admin_operation","device_authorization","delete_receipt","deletion_transparency_entry"},proof
+            pin = Pin(client.chain,created["log_id"],bytes(relay.relay_key.verify_key))
+            ledger,receipt,entry = proof["ledger"],proof["delete_receipt"],proof["deletion_transparency_entry"]
+            pin.signed(receipt,b"PALLASYNC-DELETE-RECEIPT-v3\0")
+            assert ledger_hash(ledger) == receipt["ledger_receipt_hash"]
+            assert ledger["chain_id"] == client.chain and ledger["deletion_id"] == receipt["deletion_id"]
+            pin.signed(entry,b"PALLASYNC-TRANSPARENCY-ENTRY-v3\0")
+            assert entry["operation"] == "delete" and entry["entry_index"] == receipt["transparency_index"]
+            print("PASS: Android GET /deletion proof, local signed-proof/bundle file readback and post-confirmation erasure; Python independently verified relay receipt, deletion ledger and transparency signature",flush=True)
+            return
         match = re.search(r"pallasync_device_id=([0-9a-f-]{36})",output)
         if match is None:
             raise RuntimeError("No public Android device identity was reported")
@@ -166,5 +187,6 @@ if __name__ == "__main__":
     parser.add_argument("--rotate-epoch",action="store_true")
     parser.add_argument("--replace-device",action="store_true")
     parser.add_argument("--peer-enrollment",action="store_true")
+    parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--rebase-fault",choices=["SOURCE_STAGED","DESTINATION_COMMITTED","SOURCE_RETIRED"])
     run(parser.parse_args())
