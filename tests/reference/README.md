@@ -61,7 +61,10 @@ accepted source evidence, and constructs fresh records only for unaccepted edits
 Python decrypts both public source ciphertext and accepted replacements, checking new IDs/nonces,
 author sequence, Lamports, exact operation body/context and predecessor links. `--rebase-fault`
 accepts SOURCE_STAGED, DESTINATION_COMMITTED or SOURCE_RETIRED to interrupt the corresponding
-durable boundary. Native sessions end and the OS journal is reopened before resumption. These
+durable rebase boundary. With `--reseed`, it also accepts RESEED_ROOM_COMMITTED,
+RESEED_KEYSTORE_PROMOTED, RESEED_OUTBOX_REBASED, RESEED_ORIGIN_SELECTED or
+RESEED_COMPLETE_COMMITTED to interrupt each journaled cross-store cutover boundary and retry the
+same staged commit. Native sessions end and the OS journal is reopened before resumption. These
 targeted cases do not simulate full Android process death or complete the entire IT catalogue.
 
 `run_legacy_interop.py --relay-binary PATH` injects a frozen legacy fixture only into its own

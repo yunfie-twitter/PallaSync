@@ -223,5 +223,17 @@ if __name__ == "__main__":
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
-    parser.add_argument("--rebase-fault",choices=["SOURCE_STAGED","DESTINATION_COMMITTED","SOURCE_RETIRED"])
+    parser.add_argument(
+        "--rebase-fault",
+        choices=[
+            "SOURCE_STAGED",
+            "DESTINATION_COMMITTED",
+            "SOURCE_RETIRED",
+            "RESEED_ROOM_COMMITTED",
+            "RESEED_KEYSTORE_PROMOTED",
+            "RESEED_OUTBOX_REBASED",
+            "RESEED_ORIGIN_SELECTED",
+            "RESEED_COMPLETE_COMMITTED",
+        ],
+    )
     run(parser.parse_args())
