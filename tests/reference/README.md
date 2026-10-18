@@ -67,15 +67,18 @@ durable rebase boundary. With `--reseed`, it also accepts RESEED_ROOM_COMMITTED,
 RESEED_KEYSTORE_PROMOTED, RESEED_OUTBOX_REBASED, RESEED_ORIGIN_SELECTED or
 RESEED_COMPLETE_COMMITTED to interrupt each journaled cross-store cutover boundary and retry the
 same staged commit. Native sessions end and the OS journal is reopened before resumption. These
-targeted cases do not simulate full Android process death or complete the entire IT catalogue. A
-successful `--reseed` case also explicitly replays the retired source after cutover and requires
+standard boundary retries use the same instrumentation process and do not complete the entire IT
+catalogue; `--rebase-process-death` separately verifies fresh-process recovery for the five reseed
+cutover boundaries. A successful `--reseed` case also explicitly replays the retired source after cutover and requires
 the Android coordinator to report a verified empty suffix.
 
-The `--reseed --rebase-fault` cutover path has been run against the disposable AVD for all five
+The `--reseed --rebase-fault` cutover path has passed against the disposable AVD for all five
 durable boundaries (`RESEED_ROOM_COMMITTED`, `RESEED_KEYSTORE_PROMOTED`,
 `RESEED_OUTBOX_REBASED`, `RESEED_ORIGIN_SELECTED`, and `RESEED_COMPLETE_COMMITTED`), plus a
-no-fault cutover. These retries preserve durable state within the same process; they do not
-simulate process death or prove late-writer/split-view reconciliation.
+no-fault cutover. Adding `--rebase-process-death` kills instrumentation after the selected
+boundary, then starts a fresh process against the test-only file-backed Room database and
+persistent Android Keystore state. All five process-death resumes passed. These targeted runs do
+not prove late-writer/split-view reconciliation or the full relay-migration catalogue.
 
 `run_legacy_interop.py --relay-binary PATH` injects a frozen legacy fixture only into its own
 disposable SQLite file. Independent Python derives the v2.1 keys and verifies original device

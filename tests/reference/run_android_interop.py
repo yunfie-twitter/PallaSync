@@ -77,21 +77,47 @@ def run(args):
             relay_cert = (relay.directory/"tls.pem").read_bytes()
             if target_relay is not None:
                 relay_cert += (target_relay.directory/"tls.pem").read_bytes()
-            command = ["shell","am","instrument","-w","-r","-e","class",
-                "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
-                "-e","relay_ca_base64",base64.b64encode(relay_cert).decode(),
-                "-e","rotate_epoch","true" if args.rotate_epoch else "false",
-                "-e","replace_device","true" if args.replace_device else "false",
-                "-e","delete_chain","true" if args.delete_chain else "false",
-                "-e","delete_response_lost","true" if args.delete_response_lost else "false"]
-            if target_relay is not None:
-                command.extend(["-e","reseed_target_origin",target_relay.origin])
-            if args.rebase_fault:
-                command.extend(["-e","rebase_fault",args.rebase_fault])
-            if handoff is not None:
-                command.extend(["-e","peer_transfer_id",handoff.identifier])
-            command.append("com.yunfie.illustia.test/com.yunfie.illustia.pallasync.PallaSyncTestRunner")
-            output = adb(*command)
+            if args.rebase_process_death and (not args.reseed or not args.rebase_fault):
+                raise ValueError("--rebase-process-death requires --reseed and --rebase-fault")
+
+            def instrumentation(resume_after_death=False):
+                command = ["shell","am","instrument","-w","-r","-e","class",
+                    "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
+                    "-e","relay_ca_base64",base64.b64encode(relay_cert).decode(),
+                    "-e","rotate_epoch","true" if args.rotate_epoch else "false",
+                    "-e","replace_device","true" if args.replace_device else "false",
+                    "-e","delete_chain","true" if args.delete_chain else "false",
+                    "-e","delete_response_lost","true" if args.delete_response_lost else "false",
+                    "-e","reseed_process_death","true" if args.rebase_process_death else "false",
+                    "-e","reseed_resume_after_death","true" if resume_after_death else "false"]
+                if target_relay is not None:
+                    command.extend(["-e","reseed_target_origin",target_relay.origin])
+                if args.rebase_fault and not resume_after_death:
+                    command.extend(["-e","rebase_fault",args.rebase_fault])
+                if handoff is not None:
+                    command.extend(["-e","peer_transfer_id",handoff.identifier])
+                command.append("com.yunfie.illustia.test/com.yunfie.illustia.pallasync.PallaSyncTestRunner")
+                result = subprocess.run(
+                    [args.adb,"-s",device_serial,*command],capture_output=True,text=True,
+                    encoding="utf-8",errors="replace",timeout=600,
+                )
+                return result.returncode, result.stdout + result.stderr
+
+            if args.rebase_process_death:
+                first_code, first_output = instrumentation()
+                if "reseed_process_death_phase_one=ready" not in first_output or "OK (1 test)" in first_output:
+                    raise RuntimeError(
+                        "Android did not terminate at the requested persisted reseed boundary "
+                        f"(exit {first_code}): {first_output[-5000:]}"
+                    )
+                adb("shell","am","force-stop","com.yunfie.illustia")
+                resume_code, resume_output = instrumentation(resume_after_death=True)
+                if resume_code != 0:
+                    raise RuntimeError("Android process-death resume instrumentation failed: "+resume_output[-2000:])
+                output = first_output + "\nPROCESS-DEATH RESUME\n" + resume_output
+                print(f"PASS: first instrumentation process terminated at the committed boundary (exit {first_code}); a fresh process reopened Room/Keystore state",flush=True)
+            else:
+                _, output = instrumentation()
         finally:
             adb("reverse","--remove",f"tcp:{port}")
             if target_relay is not None:
@@ -243,6 +269,11 @@ if __name__ == "__main__":
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
+    parser.add_argument(
+        "--rebase-process-death",
+        action="store_true",
+        help="kill instrumentation after the selected durable reseed boundary, then resume in a fresh process",
+    )
     parser.add_argument(
         "--rebase-fault",
         choices=[
