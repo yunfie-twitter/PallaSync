@@ -65,7 +65,9 @@ durable rebase boundary. With `--reseed`, it also accepts RESEED_ROOM_COMMITTED,
 RESEED_KEYSTORE_PROMOTED, RESEED_OUTBOX_REBASED, RESEED_ORIGIN_SELECTED or
 RESEED_COMPLETE_COMMITTED to interrupt each journaled cross-store cutover boundary and retry the
 same staged commit. Native sessions end and the OS journal is reopened before resumption. These
-targeted cases do not simulate full Android process death or complete the entire IT catalogue.
+targeted cases do not simulate full Android process death or complete the entire IT catalogue. A
+successful `--reseed` case also explicitly replays the retired source after cutover and requires
+the Android coordinator to report a verified empty suffix.
 
 `run_legacy_interop.py --relay-binary PATH` injects a frozen legacy fixture only into its own
 disposable SQLite file. Independent Python derives the v2.1 keys and verifies original device

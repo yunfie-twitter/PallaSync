@@ -98,6 +98,8 @@ def run(args):
         if target_relay is not None:
             if "pallasync_reseed_generation=1" not in output:
                 raise RuntimeError("Android did not report a completed generation+1 reseed cutover")
+            if "pallasync_reseed_source_audit=clean" not in output:
+                raise RuntimeError("Android did not verify the retained source after cutover")
             target_http = ReferenceHTTP(target_relay,client,True,schema)
             reseed_prefix = "/pallasync/v3/chains/"+client.chain
             status,parameters,_ = target_http.request("GET",reseed_prefix+"/parameters",admin=True)
