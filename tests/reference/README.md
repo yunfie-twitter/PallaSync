@@ -39,7 +39,9 @@ examples; their mocked prior bounds never establish a production checkpoint.
 The isolated runner also verifies exact mnemonic enrollment retries, pending-device restrictions,
 HPKE envelope receipt/commitment and acknowledgement using independent Python crypto.
 `run_android_interop.py` runs one real coordinator/JNI/Room/Keystore enrollment/outbox case on
-only the disposable `PallaSyncV3Conformance` AVD (`emulator-5580`), then independently verifies
+only the disposable `PallaSyncV3Conformance` AVD. It discovers the running emulator serial via
+`adb devices` and `adb emu avd name`, and requires exactly one matching AVD; it does not assume a
+fixed emulator serial. It then independently verifies
 and decrypts its records. It requires freshly built APKs and explicit disposable TLS arguments.
 An absent Android harness argument skips the instrumentation case; it does not mark an IT passed.
 This targeted case is not completion of the 50 three-party IT cases or the Android stress tests.
@@ -68,6 +70,12 @@ same staged commit. Native sessions end and the OS journal is reopened before re
 targeted cases do not simulate full Android process death or complete the entire IT catalogue. A
 successful `--reseed` case also explicitly replays the retired source after cutover and requires
 the Android coordinator to report a verified empty suffix.
+
+The `--reseed --rebase-fault` cutover path has been run against the disposable AVD for all five
+durable boundaries (`RESEED_ROOM_COMMITTED`, `RESEED_KEYSTORE_PROMOTED`,
+`RESEED_OUTBOX_REBASED`, `RESEED_ORIGIN_SELECTED`, and `RESEED_COMPLETE_COMMITTED`), plus a
+no-fault cutover. These retries preserve durable state within the same process; they do not
+simulate process death or prove late-writer/split-view reconciliation.
 
 `run_legacy_interop.py --relay-binary PATH` injects a frozen legacy fixture only into its own
 disposable SQLite file. Independent Python derives the v2.1 keys and verifies original device
