@@ -80,6 +80,13 @@ boundary, then starts a fresh process against the test-only file-backed Room dat
 persistent Android Keystore state. All five process-death resumes passed. These targeted runs do
 not prove late-writer/split-view reconciliation or the full relay-migration catalogue.
 
+`--rebase-fault RESEED_SOURCE_CAPTURED --rebase-process-death --reseed-late-source-write` injects
+one valid Python device record into the old generation after Android durably captures its final
+source report and the app process exits. Android must resume cutover from the saved report, then
+report exactly one unimported edit; Python verifies that the record remains on the source and is
+absent from the target. This precise race case passed. Other concurrent-write timings and signed
+split-view/fork response cases remain unverified.
+
 `run_legacy_interop.py --relay-binary PATH` injects a frozen legacy fixture only into its own
 disposable SQLite file. Independent Python derives the v2.1 keys and verifies original device
 and record signatures, AEAD, paging and nonce denial after restart. It checks that the absent

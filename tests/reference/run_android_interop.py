@@ -64,6 +64,11 @@ def run(args):
         python_record = client.record("palleria.search_history/3",[{"entity_id":"Python interop","operation":"upsert","lamport":1_000_000,"created_at_ms":1,"context":{},"body":{"query":"Python interop"}}])
         status,accepted,_ = http.request("POST",prefix+"/records",{"records":[python_record]})
         assert status == 200 and len(accepted["accepted"]) == 1,accepted
+        if args.reseed_late_source_write and (
+            not args.rebase_process_death or args.rebase_fault != "RESEED_SOURCE_CAPTURED"
+        ):
+            raise ValueError("--reseed-late-source-write requires --rebase-process-death and RESEED_SOURCE_CAPTURED")
+        late_source_record = None
         port = relay.proxy.server_port
         adb("reverse",f"tcp:{port}",f"tcp:{port}")
         if target_relay is not None:
@@ -89,7 +94,8 @@ def run(args):
                     "-e","delete_chain","true" if args.delete_chain else "false",
                     "-e","delete_response_lost","true" if args.delete_response_lost else "false",
                     "-e","reseed_process_death","true" if args.rebase_process_death else "false",
-                    "-e","reseed_resume_after_death","true" if resume_after_death else "false"]
+                    "-e","reseed_resume_after_death","true" if resume_after_death else "false",
+                    "-e","reseed_expect_late_source_write","true" if args.reseed_late_source_write else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
                 if args.rebase_fault and not resume_after_death:
@@ -110,6 +116,15 @@ def run(args):
                         "Android did not terminate at the requested persisted reseed boundary "
                         f"(exit {first_code}): {first_output[-5000:]}"
                     )
+                if args.reseed_late_source_write:
+                    late_source_record = client.record(
+                        "palleria.search_history/3",
+                        [{"entity_id":"Python late source","operation":"upsert","lamport":1_000_002,
+                          "created_at_ms":2,"context":{},"body":{"query":"Python late source"}}],
+                    )
+                    status,accepted,_ = http.request("POST",prefix+"/records",{"records":[late_source_record]})
+                    if status != 200 or len(accepted.get("accepted",[])) != 1:
+                        raise RuntimeError(f"Independent late source write was not accepted: {status} {accepted}")
                 adb("shell","am","force-stop","com.yunfie.illustia")
                 resume_code, resume_output = instrumentation(resume_after_death=True)
                 if resume_code != 0:
@@ -142,8 +157,12 @@ def run(args):
         if target_relay is not None:
             if "pallasync_reseed_generation=1" not in output:
                 raise RuntimeError("Android did not report a completed generation+1 reseed cutover")
-            if "pallasync_reseed_source_audit=clean" not in output:
-                raise RuntimeError("Android did not verify the retained source after cutover")
+            expected_source_audit = "unimported" if args.reseed_late_source_write else "clean"
+            if f"pallasync_reseed_source_audit={expected_source_audit}" not in output:
+                raise RuntimeError("Android did not report the expected post-cutover source audit")
+            if args.reseed_late_source_write:
+                if "pallasync_reseed_unimported_count=1" not in output or late_source_record is None:
+                    raise RuntimeError("Android did not report exactly one unimported source write")
             target_http = ReferenceHTTP(target_relay,client,True,schema)
             reseed_prefix = "/pallasync/v3/chains/"+client.chain
             status,parameters,_ = target_http.request("GET",reseed_prefix+"/parameters",admin=True)
@@ -156,6 +175,27 @@ def run(args):
             verify(device,base64.urlsafe_b64decode(device["device_public_key"]+"="),b"PALLASYNC-DEVICE-RECORD-v3\0")
             verify(device["enrollment"],bytes(client.admin.verify_key),b"PALLASYNC-ENROLLMENT-v3\0")
             assert any(item["status"] == "active" and item["device_record"]["device_id"] == device["device_id"] for item in registry["items"])
+            if args.reseed_late_source_write:
+                late_hash = object_hash(late_source_record)
+
+                def contains_record(remote):
+                    cursor = None
+                    while True:
+                        path = reseed_prefix+"/records?limit=200"+(("&cursor="+cursor) if cursor else "")
+                        status,page,_ = remote.request("GET",path,admin=True)
+                        if status != 200:
+                            raise RuntimeError(f"Could not independently audit migrated records: {status} {page}")
+                        if any(object_hash(entry["object"]) == late_hash for entry in page["items"]):
+                            return True
+                        cursor = page["next_cursor"]
+                        if cursor is None:
+                            return False
+
+                if not contains_record(http):
+                    raise RuntimeError("Late source write was not retained on the source relay")
+                if contains_record(target_http):
+                    raise RuntimeError("Late source write was silently copied to the target relay")
+                print("PASS: independent old-generation write after final source capture stayed on the source relay and Android reported it as one unimported edit",flush=True)
             print("PASS: Android explicitly selected and consented to a second isolated relay, imported verified state, committed generation+1, validated the new relay authority, registered/read back/acked a fresh device, and switched origin; Python independently verified target parameters and device certificates",flush=True)
             return
         assert "pallasync_local_boundary=verified" in output,"No actual Android pre-persistence recovery-artifact boundary result"
@@ -269,6 +309,7 @@ if __name__ == "__main__":
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
+    parser.add_argument("--reseed-late-source-write",action="store_true",help="write one independent old-generation record after source capture and require an unimported-edit report")
     parser.add_argument(
         "--rebase-process-death",
         action="store_true",
@@ -281,6 +322,7 @@ if __name__ == "__main__":
             "DESTINATION_COMMITTED",
             "SOURCE_RETIRED",
             "RESEED_ROOM_COMMITTED",
+            "RESEED_SOURCE_CAPTURED",
             "RESEED_KEYSTORE_PROMOTED",
             "RESEED_OUTBOX_REBASED",
             "RESEED_ORIGIN_SELECTED",
