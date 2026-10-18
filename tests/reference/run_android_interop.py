@@ -54,6 +54,10 @@ def run(args):
     with ExitStack() as stack:
         relay = stack.enter_context(IsolatedRelay(args.relay_binary,chain_delay=1.5,drop_delete_response=args.delete_response_lost))
         target_relay = stack.enter_context(IsolatedRelay(args.relay_binary)) if args.reseed else None
+        if args.reseed_split_view:
+            if target_relay is None:
+                raise ValueError("--reseed-split-view requires --reseed")
+            target_relay.on_keys_ack = lambda: setattr(relay, "split_view_next_transparency_head", True)
         http = ReferenceHTTP(relay,client,True,schema)
         genesis = client.genesis()
         status,created,_ = http.request("POST","/pallasync/v3/chains",genesis,True)
@@ -95,7 +99,8 @@ def run(args):
                     "-e","delete_response_lost","true" if args.delete_response_lost else "false",
                     "-e","reseed_process_death","true" if args.rebase_process_death else "false",
                     "-e","reseed_resume_after_death","true" if resume_after_death else "false",
-                    "-e","reseed_expect_late_source_write","true" if args.reseed_late_source_write else "false"]
+                    "-e","reseed_expect_late_source_write","true" if args.reseed_late_source_write else "false",
+                    "-e","reseed_expect_split_view","true" if args.reseed_split_view else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
                 if args.rebase_fault and not resume_after_death:
@@ -155,6 +160,22 @@ def run(args):
         if handoff is not None:
             handoff.finish()
         if target_relay is not None:
+            if args.reseed_split_view:
+                for marker in (
+                    "pallasync_reseed_split_view_rejected=true",
+                    "pallasync_reseed_split_view_evidence=retained",
+                    "pallasync_reseed_split_view_writes=",
+                ):
+                    if marker not in output:
+                        raise RuntimeError("Android did not prove signed split-view rejection: " + marker)
+                if "pallasync_reseed_generation=1" in output:
+                    raise RuntimeError("Android reported local reseed cutover after a signed split-view")
+                target_http = ReferenceHTTP(target_relay,client,True,schema)
+                status,parameters,_ = target_http.request("GET","/pallasync/v3/chains/"+client.chain+"/parameters",admin=True)
+                if status != 200 or parameters["generation"] != 1:
+                    raise RuntimeError("Split-view test did not reach the post-target-commit, pre-local-cutover boundary")
+                print("PASS: Android rejected a relay-signed source checkpoint contradicting its replayed prefix, retained signed evidence, paused writes, and preserved the local source chain while the target commit remained isolated",flush=True)
+                return
             if "pallasync_reseed_generation=1" not in output:
                 raise RuntimeError("Android did not report a completed generation+1 reseed cutover")
             expected_source_audit = "unimported" if args.reseed_late_source_write else "clean"
@@ -309,6 +330,7 @@ if __name__ == "__main__":
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
+    parser.add_argument("--reseed-split-view",action="store_true",help="serve one relay-signed contradictory transparency head after target-key acknowledgement and require quarantine without local cutover")
     parser.add_argument("--reseed-late-source-write",action="store_true",help="write one independent old-generation record after source capture and require an unimported-edit report")
     parser.add_argument(
         "--rebase-process-death",

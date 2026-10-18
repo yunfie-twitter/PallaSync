@@ -30,6 +30,8 @@ class IsolatedRelay:
         self.directory = Path(self.temporary.name)
         self.process = None
         self.drop_delete_response = drop_delete_response
+        self.split_view_next_transparency_head = False
+        self.on_keys_ack = None
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
         reserve = socket.socket()
         reserve.bind(("127.0.0.1",0))
@@ -56,6 +58,22 @@ class IsolatedRelay:
                 connection.request(self.command,self.path,body,headers)
                 response = connection.getresponse()
                 payload = response.read(8_388_609)
+                if response.status == 200 and self.command == "POST" and self.path.endswith("/keys/ack"):
+                    callback = harness.on_keys_ack
+                    if callback is not None:
+                        callback()
+                if (
+                    response.status == 200
+                    and self.command == "GET"
+                    and self.path.endswith("/transparency/head")
+                    and harness.split_view_next_transparency_head
+                ):
+                    harness.split_view_next_transparency_head = False
+                    value = strict_loads(payload)
+                    head = value["head"]
+                    head["head_hash"] = b64(digest(b"Palleria isolated signed split-view test"))
+                    value["head"] = signed(head, harness.relay_key, b"PALLASYNC-TRANSPARENCY-HEAD-v3\0", "relay_signature")
+                    payload = jcs(value)
                 if (harness.drop_delete_response and self.command == "DELETE"
                         and self.path.startswith("/pallasync/v3/chains/") and self.path.count("/") == 4):
                     harness.drop_delete_response = False
