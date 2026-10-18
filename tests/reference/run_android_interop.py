@@ -18,8 +18,26 @@ from isolated_relay import IsolatedRelay, ROOT
 
 
 def run(args):
+    listed = subprocess.run([args.adb,"devices"],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=30)
+    if listed.returncode != 0:
+        raise RuntimeError("ADB device enumeration failed")
+    candidates = []
+    for line in listed.stdout.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 2 or fields[1] != "device" or not fields[0].startswith("emulator-"):
+            continue
+        name = subprocess.run(
+            [args.adb,"-s",fields[0],"emu","avd","name"],
+            capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=30,
+        )
+        if name.returncode == 0 and name.stdout.splitlines() and name.stdout.splitlines()[0].strip() == "PallaSyncV3Conformance":
+            candidates.append(fields[0])
+    if len(candidates) != 1:
+        raise RuntimeError("Exactly one running PallaSyncV3Conformance AVD is required")
+    device_serial = candidates[0]
+
     def adb(*command):
-        result = subprocess.run([args.adb,"-s","emulator-5580",*command],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=600 if command[0] == "shell" else 240)
+        result = subprocess.run([args.adb,"-s",device_serial,*command],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=600 if command[0] == "shell" else 240)
         if result.returncode != 0:
             raise RuntimeError("Managed emulator command failed: "+(result.stderr or "")[-2000:])
         return result.stdout
