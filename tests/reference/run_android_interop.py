@@ -54,10 +54,12 @@ def run(args):
     with ExitStack() as stack:
         relay = stack.enter_context(IsolatedRelay(args.relay_binary,chain_delay=1.5,drop_delete_response=args.delete_response_lost))
         target_relay = stack.enter_context(IsolatedRelay(args.relay_binary)) if args.reseed else None
-        if args.reseed_split_view:
-            if target_relay is None:
-                raise ValueError("--reseed-split-view requires --reseed")
-            target_relay.on_keys_ack = lambda: setattr(relay, "split_view_next_transparency_head", True)
+        if (args.reseed_split_view or args.reseed_pre_capture_write) and target_relay is None:
+            raise ValueError("reseed split-view/write races require --reseed")
+        if args.reseed_split_view and args.reseed_pre_capture_write:
+            raise ValueError("--reseed-split-view and --reseed-pre-capture-write are separate scenarios")
+        if args.reseed_pre_capture_write and (args.rebase_process_death or args.reseed_late_source_write):
+            raise ValueError("--reseed-pre-capture-write is a separate live-writer scenario")
         http = ReferenceHTTP(relay,client,True,schema)
         genesis = client.genesis()
         status,created,_ = http.request("POST","/pallasync/v3/chains",genesis,True)
@@ -68,6 +70,27 @@ def run(args):
         python_record = client.record("palleria.search_history/3",[{"entity_id":"Python interop","operation":"upsert","lamport":1_000_000,"created_at_ms":1,"context":{},"body":{"query":"Python interop"}}])
         status,accepted,_ = http.request("POST",prefix+"/records",{"records":[python_record]})
         assert status == 200 and len(accepted["accepted"]) == 1,accepted
+        pre_capture_source_record = None
+        pre_capture_write_failure = []
+        if args.reseed_split_view:
+            target_relay.on_keys_ack = lambda: setattr(relay, "split_view_next_transparency_head", True)
+        if args.reseed_pre_capture_write:
+            def inject_pre_capture_source_write():
+                nonlocal pre_capture_source_record
+                if pre_capture_source_record is not None:
+                    return
+                try:
+                    pre_capture_source_record = client.record(
+                        "palleria.search_history/3",
+                        [{"entity_id":"Python source race before capture","operation":"upsert","lamport":1_000_002,
+                          "created_at_ms":2,"context":{},"body":{"query":"Python source race before capture"}}],
+                    )
+                    write_status,write_result,_ = http.request("POST",prefix+"/records",{"records":[pre_capture_source_record]})
+                    if write_status != 200 or len(write_result.get("accepted",[])) != 1:
+                        pre_capture_write_failure.append(f"{write_status} {write_result}")
+                except BaseException as error:
+                    pre_capture_write_failure.append(repr(error))
+            target_relay.on_keys_ack = inject_pre_capture_source_write
         if args.reseed_late_source_write and (
             not args.rebase_process_death or args.rebase_fault != "RESEED_SOURCE_CAPTURED"
         ):
@@ -100,7 +123,8 @@ def run(args):
                     "-e","reseed_process_death","true" if args.rebase_process_death else "false",
                     "-e","reseed_resume_after_death","true" if resume_after_death else "false",
                     "-e","reseed_expect_late_source_write","true" if args.reseed_late_source_write else "false",
-                    "-e","reseed_expect_split_view","true" if args.reseed_split_view else "false"]
+                    "-e","reseed_expect_split_view","true" if args.reseed_split_view else "false",
+                    "-e","reseed_expect_pre_capture_source_write","true" if args.reseed_pre_capture_write else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
                 if args.rebase_fault and not resume_after_death:
@@ -176,9 +200,16 @@ def run(args):
                     raise RuntimeError("Split-view test did not reach the post-target-commit, pre-local-cutover boundary")
                 print("PASS: Android rejected a relay-signed source checkpoint contradicting its replayed prefix, retained signed evidence, paused writes, and preserved the local source chain while the target commit remained isolated",flush=True)
                 return
+            if args.reseed_pre_capture_write:
+                if pre_capture_write_failure or pre_capture_source_record is None:
+                    raise RuntimeError("Independent source write at the target acknowledgement boundary failed: " + repr(pre_capture_write_failure))
+                if "pallasync_reseed_generation=1" not in output or "pallasync_reseed_source_audit=unimported" not in output:
+                    raise RuntimeError("Android did not report completion and the expected source-only race")
+                if "pallasync_reseed_unimported_count=1" not in output:
+                    raise RuntimeError("Android did not report exactly one pre-capture source write")
             if "pallasync_reseed_generation=1" not in output:
                 raise RuntimeError("Android did not report a completed generation+1 reseed cutover")
-            expected_source_audit = "unimported" if args.reseed_late_source_write else "clean"
+            expected_source_audit = "unimported" if (args.reseed_late_source_write or args.reseed_pre_capture_write) else "clean"
             if f"pallasync_reseed_source_audit={expected_source_audit}" not in output:
                 raise RuntimeError("Android did not report the expected post-cutover source audit")
             if args.reseed_late_source_write:
@@ -196,8 +227,9 @@ def run(args):
             verify(device,base64.urlsafe_b64decode(device["device_public_key"]+"="),b"PALLASYNC-DEVICE-RECORD-v3\0")
             verify(device["enrollment"],bytes(client.admin.verify_key),b"PALLASYNC-ENROLLMENT-v3\0")
             assert any(item["status"] == "active" and item["device_record"]["device_id"] == device["device_id"] for item in registry["items"])
-            if args.reseed_late_source_write:
-                late_hash = object_hash(late_source_record)
+            racing_source_record = late_source_record if args.reseed_late_source_write else pre_capture_source_record
+            if args.reseed_late_source_write or args.reseed_pre_capture_write:
+                late_hash = object_hash(racing_source_record)
 
                 def contains_record(remote):
                     cursor = None
@@ -216,7 +248,8 @@ def run(args):
                     raise RuntimeError("Late source write was not retained on the source relay")
                 if contains_record(target_http):
                     raise RuntimeError("Late source write was silently copied to the target relay")
-                print("PASS: independent old-generation write after final source capture stayed on the source relay and Android reported it as one unimported edit",flush=True)
+                timing = "after final source capture" if args.reseed_late_source_write else "after target acknowledgement and before final source capture"
+                print(f"PASS: independent old-generation write {timing} stayed on the source relay and Android reported it as one unimported edit",flush=True)
             print("PASS: Android explicitly selected and consented to a second isolated relay, imported verified state, committed generation+1, validated the new relay authority, registered/read back/acked a fresh device, and switched origin; Python independently verified target parameters and device certificates",flush=True)
             return
         assert "pallasync_local_boundary=verified" in output,"No actual Android pre-persistence recovery-artifact boundary result"
@@ -331,6 +364,7 @@ if __name__ == "__main__":
     parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-split-view",action="store_true",help="serve one relay-signed contradictory transparency head after target-key acknowledgement and require quarantine without local cutover")
+    parser.add_argument("--reseed-pre-capture-write",action="store_true",help="append an independent old-generation record after target key acknowledgement but before the final source capture; require a source-only unimported-edit report")
     parser.add_argument("--reseed-late-source-write",action="store_true",help="write one independent old-generation record after source capture and require an unimported-edit report")
     parser.add_argument(
         "--rebase-process-death",
