@@ -5,16 +5,90 @@ Only the task-owned PallaSyncV3Conformance emulator is accepted.
 """
 import argparse
 import base64
+import struct
 from contextlib import ExitStack
 import re
 import subprocess
 import uuid
 from pathlib import Path
-from protocol import b64, object_hash, strict_loads, verify
+from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_decrypt
+from protocol import b64, decode, epoch_keys, jcs, object_hash, strict_loads, verify
 from attestations import Pin, ledger_hash
 from crypto_client import CryptoClient
 from http_client import ReferenceHTTP
 from isolated_relay import IsolatedRelay, ROOT
+
+
+def verify_reseed_snapshot_contains(remote, client, prefix, parameters, new_device_public_key, entity_id):
+    """Independently decrypt the committed target snapshot; do not expect source log records copied verbatim."""
+    status, snapshot_page, _ = remote.request("GET", prefix + "/snapshots?limit=200", admin=True)
+    if status != 200:
+        raise RuntimeError(f"Could not read target compactions: {status} {snapshot_page}")
+    compaction = next(
+        (item for item in snapshot_page["items"] if item["generation"] == parameters["generation"]),
+        None,
+    )
+    if compaction is None:
+        raise RuntimeError("Committed target snapshot is missing")
+    verify(compaction, new_device_public_key, b"PALLASYNC-COMPACTION-v3\0")
+    epoch_hash = compaction["epoch_hash"]
+    status, epoch_page, _ = remote.request("GET", prefix + "/epochs?limit=200", admin=True)
+    if status != 200:
+        raise RuntimeError(f"Could not read target epoch history: {status} {epoch_page}")
+    epoch = next(
+        (item["epoch"] for item in epoch_page["items"] if item["epoch_hash"] == epoch_hash),
+        None,
+    )
+    if epoch is None:
+        raise RuntimeError("Target compaction's epoch is missing")
+    status, envelope_response, _ = remote.request(
+        "GET", prefix + f"/epochs/{epoch['epoch']}/recovery-envelope", admin=True
+    )
+    if status != 200:
+        raise RuntimeError(f"Could not read target recovery envelope: {status} {envelope_response}")
+    envelope = envelope_response["envelope"]
+    verify(envelope, decode(parameters["admin_public_key"], 32), b"PALLASYNC-EPOCH-ENVELOPE-v3\0")
+    binding_keys = {
+        "chain_id", "generation", "epoch", "previous_epoch_hash", "epoch_commitment",
+        "signer_kind", "signer_device_id", "envelope_id", "recipient_kind",
+        "recipient_device_id", "recipient_key_hash",
+    }
+    binding = {key: envelope[key] for key in binding_keys}
+    epoch_secret = crypto_aead_xchacha20poly1305_ietf_decrypt(
+        decode(envelope["ciphertext"]), jcs(binding), decode(envelope["nonce"], 24), client.roots["recovery_kek"]
+    )
+    record_key = epoch_keys(client.roots["chain_id_digest"], epoch["epoch"], epoch_secret)["record"]
+    for reference in compaction["snapshot_parts"]:
+        status, part_response, _ = remote.request(
+            "GET", prefix + "/snapshots/parts/" + reference["record_id"], admin=True
+        )
+        if status != 200:
+            raise RuntimeError(f"Could not fetch committed snapshot part: {status} {part_response}")
+        record = part_response["record"]
+        if object_hash(record) != reference["record_hash"]:
+            raise RuntimeError("Target snapshot part hash does not match its compaction")
+        verify(record, new_device_public_key, b"PALLASYNC-SYNC-RECORD-v3\0")
+        aad = {"type": "PALLASYNC-AAD-v3", **{key: record[key] for key in (
+            "version", "chain_id", "generation", "record_id", "device_id", "epoch", "collection_tag"
+        )}}
+        padded = crypto_aead_xchacha20poly1305_ietf_decrypt(
+            decode(record["encrypted_payload"]), jcs(aad), decode(record["payload_nonce"], 24), record_key
+        )
+        length = struct.unpack(">I", padded[:4])[0]
+        if length > len(padded) - 4:
+            raise RuntimeError("Snapshot frame length exceeds its padded payload")
+        part = strict_loads(padded[4:4 + length])
+        if (
+            part.get("type") == "PALLASYNC-SNAPSHOT-v3"
+            and part.get("collection") == "pallasync.snapshot/3"
+            and part.get("compaction_id") == compaction["compaction_id"]
+            and any(
+                entry.get("kind") == "entity" and entry.get("entity_id") == entity_id
+                for entry in part.get("entries", [])
+            )
+        ):
+            return compaction
+    raise RuntimeError("Committed target snapshot does not contain the racing source entity")
 
 
 def run(args):
@@ -54,12 +128,15 @@ def run(args):
     with ExitStack() as stack:
         relay = stack.enter_context(IsolatedRelay(args.relay_binary,chain_delay=1.5,drop_delete_response=args.delete_response_lost))
         target_relay = stack.enter_context(IsolatedRelay(args.relay_binary)) if args.reseed else None
-        if (args.reseed_split_view or args.reseed_pre_capture_write) and target_relay is None:
+        if (args.reseed_split_view or args.reseed_pre_capture_write or args.reseed_staging_write) and target_relay is None:
             raise ValueError("reseed split-view/write races require --reseed")
-        if args.reseed_split_view and args.reseed_pre_capture_write:
-            raise ValueError("--reseed-split-view and --reseed-pre-capture-write are separate scenarios")
+        race_scenarios = sum((args.reseed_split_view, args.reseed_pre_capture_write, args.reseed_staging_write))
+        if race_scenarios > 1:
+            raise ValueError("split-view, staging-write and pre-capture-write are separate scenarios")
         if args.reseed_pre_capture_write and (args.rebase_process_death or args.reseed_late_source_write):
             raise ValueError("--reseed-pre-capture-write is a separate live-writer scenario")
+        if args.reseed_staging_write and (args.rebase_process_death or args.reseed_late_source_write):
+            raise ValueError("--reseed-staging-write is a separate live-writer scenario")
         http = ReferenceHTTP(relay,client,True,schema)
         genesis = client.genesis()
         status,created,_ = http.request("POST","/pallasync/v3/chains",genesis,True)
@@ -74,7 +151,7 @@ def run(args):
         pre_capture_write_failure = []
         if args.reseed_split_view:
             target_relay.on_keys_ack = lambda: setattr(relay, "split_view_next_transparency_head", True)
-        if args.reseed_pre_capture_write:
+        if args.reseed_pre_capture_write or args.reseed_staging_write:
             def inject_pre_capture_source_write():
                 nonlocal pre_capture_source_record
                 if pre_capture_source_record is not None:
@@ -90,7 +167,10 @@ def run(args):
                         pre_capture_write_failure.append(f"{write_status} {write_result}")
                 except BaseException as error:
                     pre_capture_write_failure.append(repr(error))
-            target_relay.on_keys_ack = inject_pre_capture_source_write
+            if args.reseed_pre_capture_write:
+                target_relay.on_keys_ack = inject_pre_capture_source_write
+        if args.reseed_staging_write:
+            target_relay.on_snapshot_part = inject_pre_capture_source_write
         if args.reseed_late_source_write and (
             not args.rebase_process_death or args.rebase_fault != "RESEED_SOURCE_CAPTURED"
         ):
@@ -124,7 +204,8 @@ def run(args):
                     "-e","reseed_resume_after_death","true" if resume_after_death else "false",
                     "-e","reseed_expect_late_source_write","true" if args.reseed_late_source_write else "false",
                     "-e","reseed_expect_split_view","true" if args.reseed_split_view else "false",
-                    "-e","reseed_expect_pre_capture_source_write","true" if args.reseed_pre_capture_write else "false"]
+                    "-e","reseed_expect_pre_capture_source_write","true" if args.reseed_pre_capture_write else "false",
+                    "-e","reseed_expect_staging_source_write","true" if args.reseed_staging_write else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
                 if args.rebase_fault and not resume_after_death:
@@ -200,6 +281,16 @@ def run(args):
                     raise RuntimeError("Split-view test did not reach the post-target-commit, pre-local-cutover boundary")
                 print("PASS: Android rejected a relay-signed source checkpoint contradicting its replayed prefix, retained signed evidence, paused writes, and preserved the local source chain while the target commit remained isolated",flush=True)
                 return
+            if args.reseed_staging_write:
+                if pre_capture_write_failure or pre_capture_source_record is None:
+                    raise RuntimeError("Independent source write during target snapshot staging failed: " + repr(pre_capture_write_failure))
+                for marker in (
+                    "pallasync_reseed_staging_race_rejected=true",
+                    "pallasync_reseed_staging_race_recovered=true",
+                    "pallasync_reseed_generation=1",
+                ):
+                    if marker not in output:
+                        raise RuntimeError("Android did not report recovery from staging race: " + marker)
             if args.reseed_pre_capture_write:
                 if pre_capture_write_failure or pre_capture_source_record is None:
                     raise RuntimeError("Independent source write at the target acknowledgement boundary failed: " + repr(pre_capture_write_failure))
@@ -228,7 +319,7 @@ def run(args):
             verify(device["enrollment"],bytes(client.admin.verify_key),b"PALLASYNC-ENROLLMENT-v3\0")
             assert any(item["status"] == "active" and item["device_record"]["device_id"] == device["device_id"] for item in registry["items"])
             racing_source_record = late_source_record if args.reseed_late_source_write else pre_capture_source_record
-            if args.reseed_late_source_write or args.reseed_pre_capture_write:
+            if args.reseed_late_source_write or args.reseed_pre_capture_write or args.reseed_staging_write:
                 late_hash = object_hash(racing_source_record)
 
                 def contains_record(remote):
@@ -246,10 +337,24 @@ def run(args):
 
                 if not contains_record(http):
                     raise RuntimeError("Late source write was not retained on the source relay")
-                if contains_record(target_http):
-                    raise RuntimeError("Late source write was silently copied to the target relay")
-                timing = "after final source capture" if args.reseed_late_source_write else "after target acknowledgement and before final source capture"
-                print(f"PASS: independent old-generation write {timing} stayed on the source relay and Android reported it as one unimported edit",flush=True)
+                target_contains = contains_record(target_http)
+                if args.reseed_staging_write:
+                    if target_contains:
+                        raise RuntimeError("Source event was copied verbatim instead of being represented by the committed state snapshot")
+                    verify_reseed_snapshot_contains(
+                        target_http,
+                        client,
+                        reseed_prefix,
+                        parameters["parameters"],
+                        decode(device["device_public_key"], 32),
+                        "Python source race before capture",
+                    )
+                    print("PASS: Android rejected the stale staged cut, synchronized the source writer, rebuilt snapshot state and committed generation+1; independent Python decrypted the committed target snapshot and found the racing source entity",flush=True)
+                else:
+                    if target_contains:
+                        raise RuntimeError("Late source write was silently copied to the target relay")
+                    timing = "after final source capture" if args.reseed_late_source_write else "after target acknowledgement and before final source capture"
+                    print(f"PASS: independent old-generation write {timing} stayed on the source relay and Android reported it as one unimported edit",flush=True)
             print("PASS: Android explicitly selected and consented to a second isolated relay, imported verified state, committed generation+1, validated the new relay authority, registered/read back/acked a fresh device, and switched origin; Python independently verified target parameters and device certificates",flush=True)
             return
         assert "pallasync_local_boundary=verified" in output,"No actual Android pre-persistence recovery-artifact boundary result"
@@ -365,6 +470,7 @@ if __name__ == "__main__":
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-split-view",action="store_true",help="serve one relay-signed contradictory transparency head after target-key acknowledgement and require quarantine without local cutover")
     parser.add_argument("--reseed-pre-capture-write",action="store_true",help="append an independent old-generation record after target key acknowledgement but before the final source capture; require a source-only unimported-edit report")
+    parser.add_argument("--reseed-staging-write",action="store_true",help="append an independent old-generation record during target snapshot-part staging and require fail-closed local retention")
     parser.add_argument("--reseed-late-source-write",action="store_true",help="write one independent old-generation record after source capture and require an unimported-edit report")
     parser.add_argument(
         "--rebase-process-death",

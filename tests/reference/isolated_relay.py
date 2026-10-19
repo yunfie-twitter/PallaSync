@@ -32,6 +32,7 @@ class IsolatedRelay:
         self.drop_delete_response = drop_delete_response
         self.split_view_next_transparency_head = False
         self.on_keys_ack = None
+        self.on_snapshot_part = None
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
         reserve = socket.socket()
         reserve.bind(("127.0.0.1",0))
@@ -60,6 +61,10 @@ class IsolatedRelay:
                 payload = response.read(8_388_609)
                 if response.status == 200 and self.command == "POST" and self.path.endswith("/keys/ack"):
                     callback = harness.on_keys_ack
+                    if callback is not None:
+                        callback()
+                if response.status == 200 and self.command == "POST" and self.path.endswith("/snapshots/parts"):
+                    callback = harness.on_snapshot_part
                     if callback is not None:
                         callback()
                 if (
