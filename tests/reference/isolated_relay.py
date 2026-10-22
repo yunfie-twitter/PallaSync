@@ -35,6 +35,9 @@ class IsolatedRelay:
         self.records_413_tracking = False
         self.records_413_original_ids = set()
         self.records_413_observations = []
+        self.records_413_hold_replacement = False
+        self.records_413_replacement_received = threading.Event()
+        self.records_413_release_replacement = threading.Event()
         self.on_keys_ack = None
         self.on_snapshot_part = None
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
@@ -49,12 +52,18 @@ class IsolatedRelay:
                 pass
 
             def forward(self):
-                if self.command == "POST" and self.path == "/__test__/arm-records-413":
+                if self.command == "POST" and self.path in {
+                    "/__test__/arm-records-413",
+                    "/__test__/arm-records-413-process-death",
+                }:
                     self.rfile.read(int(self.headers.get("Content-Length",0)))
                     harness.records_413_observations.clear()
                     harness.records_413_original_ids.clear()
                     harness.records_413_tracking = True
                     harness.records_413_armed = True
+                    harness.records_413_hold_replacement = self.path.endswith("-process-death")
+                    harness.records_413_replacement_received.clear()
+                    harness.records_413_release_replacement.clear()
                     payload = b'{"armed":true}'
                     self.send_response(200)
                     self.send_header("Content-Type","application/json")
@@ -97,6 +106,16 @@ class IsolatedRelay:
                         self.send_header("Content-Length",str(len(payload)))
                         self.end_headers()
                         self.wfile.write(payload)
+                        return
+                    if harness.records_413_hold_replacement:
+                        harness.records_413_hold_replacement = False
+                        harness.records_413_observations.append({
+                            "outcome":"held_replacement",
+                            "record_ids":[record["record_id"] for record in record_batch],
+                        })
+                        harness.records_413_replacement_received.set()
+                        harness.records_413_release_replacement.wait(120)
+                        self.close_connection = True
                         return
                 connection = http.client.HTTPConnection("127.0.0.1",harness.backend_port,timeout=10)
                 headers = {name:value for name,value in self.headers.items() if name.lower() not in {"host","connection","content-length"}}

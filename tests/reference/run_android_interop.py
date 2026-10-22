@@ -194,7 +194,7 @@ def run(args):
             if args.rebase_process_death and (not args.reseed or not args.rebase_fault):
                 raise ValueError("--rebase-process-death requires --reseed and --rebase-fault")
 
-            def instrumentation(resume_after_death=False):
+            def instrumentation_command(resume_after_death=False, records_413_resume_after_death=False):
                 command = ["shell","am","instrument","-w","-r","-e","class",
                     "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
                     "-e","relay_ca_base64",base64.b64encode(relay_cert).decode(),
@@ -209,6 +209,8 @@ def run(args):
                     "-e","reseed_expect_pre_capture_source_write","true" if args.reseed_pre_capture_write else "false",
                     "-e","reseed_expect_staging_source_write","true" if args.reseed_staging_write else "false",
                     "-e","records_413_split","true" if args.records_413_split else "false",
+                    "-e","records_413_process_death","true" if args.records_413_process_death else "false",
+                    "-e","records_413_resume_after_death","true" if records_413_resume_after_death else "false",
                     "-e","reseed_archive_probe","true" if args.reseed_archive_probe else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
@@ -217,8 +219,11 @@ def run(args):
                 if handoff is not None:
                     command.extend(["-e","peer_transfer_id",handoff.identifier])
                 command.append("com.yunfie.illustia.test/com.yunfie.illustia.pallasync.PallaSyncTestRunner")
+                return [args.adb,"-s",device_serial,*command]
+
+            def instrumentation(resume_after_death=False, records_413_resume_after_death=False):
                 result = subprocess.run(
-                    [args.adb,"-s",device_serial,*command],capture_output=True,text=True,
+                    instrumentation_command(resume_after_death, records_413_resume_after_death),capture_output=True,text=True,
                     encoding="utf-8",errors="replace",timeout=600,
                 )
                 return result.returncode, result.stdout + result.stderr
@@ -245,6 +250,35 @@ def run(args):
                     raise RuntimeError("Android process-death resume instrumentation failed: "+resume_output[-2000:])
                 output = first_output + "\nPROCESS-DEATH RESUME\n" + resume_output
                 print(f"PASS: first instrumentation process terminated at the committed boundary (exit {first_code}); a fresh process reopened Room/Keystore state",flush=True)
+            elif args.records_413_process_death:
+                process = subprocess.Popen(
+                    instrumentation_command(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if not relay.records_413_replacement_received.wait(timeout=360):
+                    process.kill()
+                    process.communicate(timeout=30)
+                    relay.records_413_release_replacement.set()
+                    raise RuntimeError("Android never sent the reduced batch after the injected 413")
+                adb("shell","am","force-stop","com.yunfie.illustia")
+                relay.records_413_release_replacement.set()
+                try:
+                    first_output,_ = process.communicate(timeout=120)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    first_output,_ = process.communicate(timeout=30)
+                    raise RuntimeError("Android instrumentation did not stop after killing the process: " + first_output[-3000:])
+                if "pallasync_records_413_process_death=resumed_and_drained" in first_output or "OK (1 test)" in first_output:
+                    raise RuntimeError("The first process completed instead of stopping at the held replacement batch")
+                resume_code,resume_output = instrumentation(records_413_resume_after_death=True)
+                if resume_code != 0 or "pallasync_records_413_process_death=resumed_and_drained" not in resume_output:
+                    raise RuntimeError("Reduced-batch retry did not resume after process death: " + resume_output[-4000:])
+                output = first_output + "\n413 PROCESS-DEATH RESUME\n" + resume_output
+                print("PASS: process died with a reduced batch pending; a fresh process reopened the same outbox and completed recovery",flush=True)
             else:
                 _, output = instrumentation()
         finally:
@@ -283,6 +317,20 @@ def run(args):
             if any(item["status"] != 200 or len(item["record_ids"]) >= len(original_ids) for item in forwarded):
                 raise RuntimeError("An outbox replacement was not smaller and accepted: " + repr(observations))
             print("PASS: one injected top-level 413 was recovered by smaller batches containing the exact same four signed record IDs",flush=True)
+        if args.records_413_process_death:
+            if "pallasync_records_413_process_death=resumed_and_drained" not in output:
+                raise RuntimeError("The restarted Android process did not drain the pending outbox")
+            observations = relay.records_413_observations
+            injected = [item for item in observations if item["outcome"] == "injected_413"]
+            held = [item for item in observations if item["outcome"] == "held_replacement"]
+            forwarded = [item for item in observations if item["outcome"] == "forwarded"]
+            if len(injected) != 1 or len(injected[0]["record_ids"]) != 4 or len(held) != 1 or len(held[0]["record_ids"]) != 2:
+                raise RuntimeError("Process-death fault did not stop after persisting the first reduced two-record batch: " + repr(observations))
+            original_ids = injected[0]["record_ids"]
+            replacement_ids = [record_id for item in forwarded for record_id in item["record_ids"]]
+            if len(forwarded) != 2 or sorted(replacement_ids) != sorted(original_ids) or any(item["status"] != 200 or len(item["record_ids"]) != 2 for item in forwarded):
+                raise RuntimeError("Restart did not resume the exact original outbox as two accepted batches: " + repr(observations))
+            print("PASS: restart retained the reduced batch ceiling and retried all four original record IDs in two accepted batches",flush=True)
         if target_relay is not None:
             if args.reseed_split_view:
                 for marker in (
@@ -469,8 +517,18 @@ def run(args):
             if not expected_split_queries.issubset(observed_split_queries):
                 raise RuntimeError("Independent receiver did not decrypt every intent from the recovered 413 batch")
             print("PASS: independent Python decrypted all four local intents recovered from the rejected batch",flush=True)
+        if args.records_413_process_death:
+            expected_split_queries = {f"Android 413 split {index}" for index in range(4)}
+            observed_split_queries = {
+                operation.get("body", {}).get("query")
+                for _, inner in android_records
+                for operation in inner.get("operations", [])
+            }
+            if not expected_split_queries.issubset(observed_split_queries):
+                raise RuntimeError("Independent receiver did not decrypt all four records resumed after process death")
+            print("PASS: independent Python decrypted all four resumed records after Android process death",flush=True)
         assert len(paused_records) == 1,"A paused editing intent was lost or signed twice"
-        expected_paused_device_seq = 2 + (4 if args.records_413_split else 0)
+        expected_paused_device_seq = 2 + (4 if args.records_413_split or args.records_413_process_death else 0)
         assert paused_records[0][0]["epoch"] == 0 and paused_records[0][1]["device_seq"] == expected_paused_device_seq
         if args.replace_device:
             assert len(replacement_records) == 1,"Replacement did not replay the unaccepted intent exactly once"
@@ -498,6 +556,7 @@ if __name__ == "__main__":
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--records-413-split",action="store_true",help="inject one isolated top-level records 413 and verify durable smaller-batch recovery")
+    parser.add_argument("--records-413-process-death",action="store_true",help="kill Android with the first reduced batch in flight and verify restart resumes the persisted outbox limit")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")
     parser.add_argument("--reseed-split-view",action="store_true",help="serve one relay-signed contradictory transparency head after target-key acknowledgement and require quarantine without local cutover")
