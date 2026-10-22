@@ -452,6 +452,10 @@ def run(args):
                     print(f"PASS: independent old-generation write {timing} stayed on the source relay and Android reported it as one unimported edit",flush=True)
             print("PASS: Android explicitly selected and consented to a second isolated relay, imported verified state, committed generation+1, validated the new relay authority, registered/read back/acked a fresh device, and switched origin; Python independently verified target parameters and device certificates",flush=True)
             return
+        if args.pruned_archive_probe:
+            assert "pallasync_pruned_archive_probe=boundary_verified_and_restored" in output,"Android did not verify and restore the pruned archive"
+            print("PASS: actual Android verified a pruned archive from its authenticated compaction boundary and restored the verified suffix",flush=True)
+            return
         assert "pallasync_local_boundary=verified" in output,"No actual Android pre-persistence recovery-artifact boundary result"
         assert "pallasync_bound_origin=verified" in output,"No actual Android bound-origin check"
         if handoff is not None:
