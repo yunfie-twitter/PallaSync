@@ -208,6 +208,7 @@ def run(args):
                     "-e","reseed_expect_split_view","true" if args.reseed_split_view else "false",
                     "-e","reseed_expect_pre_capture_source_write","true" if args.reseed_pre_capture_write else "false",
                     "-e","reseed_expect_staging_source_write","true" if args.reseed_staging_write else "false",
+                    "-e","records_413_split","true" if args.records_413_split else "false",
                     "-e","reseed_archive_probe","true" if args.reseed_archive_probe else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
@@ -267,6 +268,21 @@ def run(args):
             raise RuntimeError("Actual Android integration test did not pass")
         if handoff is not None:
             handoff.finish()
+        if args.records_413_split:
+            if "pallasync_records_413_split=passed" not in output:
+                raise RuntimeError("Android did not report successful PAYLOAD_TOO_LARGE outbox recovery")
+            observations = relay.records_413_observations
+            injected = [item for item in observations if item["outcome"] == "injected_413"]
+            forwarded = [item for item in observations if item["outcome"] == "forwarded"]
+            if len(injected) != 1 or len(injected[0]["record_ids"]) != 4:
+                raise RuntimeError("The isolated proxy did not reject exactly one four-record batch: " + repr(observations))
+            original_ids = injected[0]["record_ids"]
+            replacement_ids = [record_id for item in forwarded for record_id in item["record_ids"]]
+            if len(forwarded) < 2 or sorted(replacement_ids) != sorted(original_ids):
+                raise RuntimeError("Smaller forwarded batches did not preserve the exact signed record IDs: " + repr(observations))
+            if any(item["status"] != 200 or len(item["record_ids"]) >= len(original_ids) for item in forwarded):
+                raise RuntimeError("An outbox replacement was not smaller and accepted: " + repr(observations))
+            print("PASS: one injected top-level 413 was recovered by smaller batches containing the exact same four signed record IDs",flush=True)
         if target_relay is not None:
             if args.reseed_split_view:
                 for marker in (
@@ -443,8 +459,19 @@ def run(args):
             if cursor is None: break
         assert found,"The independent receiver did not decrypt the Android-authored application operation"
         assert initial_found,"The independent receiver did not decrypt the preserved initial local intent"
+        if args.records_413_split:
+            expected_split_queries = {f"Android 413 split {index}" for index in range(4)}
+            observed_split_queries = {
+                operation.get("body", {}).get("query")
+                for _, inner in android_records
+                for operation in inner.get("operations", [])
+            }
+            if not expected_split_queries.issubset(observed_split_queries):
+                raise RuntimeError("Independent receiver did not decrypt every intent from the recovered 413 batch")
+            print("PASS: independent Python decrypted all four local intents recovered from the rejected batch",flush=True)
         assert len(paused_records) == 1,"A paused editing intent was lost or signed twice"
-        assert paused_records[0][0]["epoch"] == 0 and paused_records[0][1]["device_seq"] == 2
+        expected_paused_device_seq = 2 + (4 if args.records_413_split else 0)
+        assert paused_records[0][0]["epoch"] == 0 and paused_records[0][1]["device_seq"] == expected_paused_device_seq
         if args.replace_device:
             assert len(replacement_records) == 1,"Replacement did not replay the unaccepted intent exactly once"
             assert replacement_records[0][0]["device_id"] == subject and replacement_records[0][0]["epoch"] == 1
@@ -470,6 +497,7 @@ if __name__ == "__main__":
     parser.add_argument("--peer-enrollment",action="store_true")
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
+    parser.add_argument("--records-413-split",action="store_true",help="inject one isolated top-level records 413 and verify durable smaller-batch recovery")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")
     parser.add_argument("--reseed-split-view",action="store_true",help="serve one relay-signed contradictory transparency head after target-key acknowledgement and require quarantine without local cutover")

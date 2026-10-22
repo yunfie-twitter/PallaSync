@@ -31,6 +31,10 @@ class IsolatedRelay:
         self.process = None
         self.drop_delete_response = drop_delete_response
         self.split_view_next_transparency_head = False
+        self.records_413_armed = False
+        self.records_413_tracking = False
+        self.records_413_original_ids = set()
+        self.records_413_observations = []
         self.on_keys_ack = None
         self.on_snapshot_part = None
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
@@ -45,6 +49,19 @@ class IsolatedRelay:
                 pass
 
             def forward(self):
+                if self.command == "POST" and self.path == "/__test__/arm-records-413":
+                    self.rfile.read(int(self.headers.get("Content-Length",0)))
+                    harness.records_413_observations.clear()
+                    harness.records_413_original_ids.clear()
+                    harness.records_413_tracking = True
+                    harness.records_413_armed = True
+                    payload = b'{"armed":true}'
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 # Integration clients revalidate public documents before every request.
                 # Pace this test transport within the unchanged disclosed rate ceilings.
                 if chain_delay and self.path.startswith("/pallasync/v3/chains"):
@@ -54,11 +71,52 @@ class IsolatedRelay:
                     self.send_error(413)
                     return
                 body = self.rfile.read(size)
+                record_batch = None
+                if self.command == "POST" and self.path.endswith("/records"):
+                    parsed = strict_loads(body)
+                    record_batch = parsed.get("records") if isinstance(parsed,dict) else None
+                    if not isinstance(record_batch,list):
+                        raise ValueError("isolated records request did not contain a records array")
+                    if harness.records_413_armed:
+                        harness.records_413_armed = False
+                        harness.records_413_original_ids = {record["record_id"] for record in record_batch}
+                        harness.records_413_observations.append({
+                            "outcome":"injected_413",
+                            "record_ids":[record["record_id"] for record in record_batch],
+                        })
+                        payload = jcs({
+                            "type":"about:blank",
+                            "title":"Payload Too Large",
+                            "status":413,
+                            "code":"PAYLOAD_TOO_LARGE",
+                            "retryable":True,
+                            "server_time_ms":int(time.time()*1000),
+                        })
+                        self.send_response(413)
+                        self.send_header("Content-Type","application/problem+json")
+                        self.send_header("Content-Length",str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                 connection = http.client.HTTPConnection("127.0.0.1",harness.backend_port,timeout=10)
                 headers = {name:value for name,value in self.headers.items() if name.lower() not in {"host","connection","content-length"}}
                 connection.request(self.command,self.path,body,headers)
                 response = connection.getresponse()
                 payload = response.read(8_388_609)
+                if record_batch is not None and harness.records_413_tracking:
+                    harness.records_413_observations.append({
+                        "outcome":"forwarded",
+                        "status":response.status,
+                        "record_ids":[record["record_id"] for record in record_batch],
+                    })
+                    observed_ids = {
+                        record_id
+                        for item in harness.records_413_observations
+                        if item["outcome"] == "forwarded"
+                        for record_id in item["record_ids"]
+                    }
+                    if harness.records_413_original_ids.issubset(observed_ids):
+                        harness.records_413_tracking = False
                 if response.status == 200 and self.command == "POST" and self.path.endswith("/keys/ack"):
                     callback = harness.on_keys_ack
                     if callback is not None:
