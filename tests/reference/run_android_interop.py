@@ -217,6 +217,7 @@ def run(args):
                     "-e","records_limit_preflight","true" if args.records_limit_preflight else "false",
                     "-e","records_413_process_death","true" if args.records_413_process_death else "false",
                     "-e","records_413_resume_after_death","true" if records_413_resume_after_death else "false",
+                    "-e","records_413_single","true" if args.records_413_single else "false",
                     "-e","reseed_archive_probe","true" if args.reseed_archive_probe else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
@@ -332,6 +333,15 @@ def run(args):
             if rejected or not forwarded or any(item["status"] != 200 or item["bytes"] > 8192 for item in forwarded):
                 raise RuntimeError("Android did not honor the signed 8192-byte request limit: " + repr(observations))
             print("PASS: Android preflight split the unchanged signed outbox to requests within the signed 8192-byte limit; Rust returned no 413",flush=True)
+        if args.records_413_single:
+            if "pallasync_records_413_single_retained=true" not in output:
+                raise RuntimeError("Android did not retain the single record rejected with PAYLOAD_TOO_LARGE")
+            observations = relay.records_413_observations
+            injected = [item for item in observations if item["outcome"] == "injected_413"]
+            forwarded = [item for item in observations if item["outcome"] == "forwarded"]
+            if len(injected) != 1 or len(injected[0]["record_ids"]) != 1 or forwarded:
+                raise RuntimeError("Single-record 413 was retried or unexpectedly forwarded: " + repr(observations))
+            print("PASS: one single-record 413 left its exact Android outbox row and durable blocker intact; no HTTP retry or relay acceptance occurred",flush=True)
         if args.records_413_process_death:
             if "pallasync_records_413_process_death=resumed_and_drained" not in output:
                 raise RuntimeError("The restarted Android process did not drain the pending outbox")
@@ -576,6 +586,7 @@ if __name__ == "__main__":
     parser.add_argument("--records-413-split",action="store_true",help="inject one isolated top-level records 413 and verify durable smaller-batch recovery")
     parser.add_argument("--records-limit-preflight",action="store_true",help="set a signed 8192-byte relay request limit and verify Android submits unchanged outbox records in requests below that advertised limit")
     parser.add_argument("--records-413-process-death",action="store_true",help="kill Android with the first reduced batch in flight and verify restart resumes the persisted outbox limit")
+    parser.add_argument("--records-413-single",action="store_true",help="inject a single-record 413 and verify Android retains the exact outbox row and does not retry it")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")
     parser.add_argument("--reseed-split-view",action="store_true",help="serve one relay-signed contradictory transparency head after target-key acknowledgement and require quarantine without local cutover")
