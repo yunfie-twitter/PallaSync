@@ -816,6 +816,17 @@ async fn snapshots_transparency_pagination_and_pruning_preserve_id_evidence() {
     let op = admin(&genesis, "prune_log", &target);
     let (s,v)=c.request("POST",&c.path("log/prune"),Some(&json!({"compaction_id":comp["compaction_id"],"through_seq":6,"admin_operation":op})),false).await;
     assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["compaction_id", "min_available_seq"].into_iter().collect(),
+        "§10.12 prune response has exactly the specified members",
+    );
+    assert_eq!(v["compaction_id"], comp["compaction_id"]);
+    assert_eq!(v["min_available_seq"], 7);
     let (_, v) = c
         .request(
             "GET",
@@ -1568,6 +1579,15 @@ async fn old_envelopes_expire_only_after_current_snapshot_and_admin_handoff() {
             .request("POST", &c.path("log/prune"), Some(&body), false)
             .await;
         assert_eq!(s, 200, "{v}");
+        assert_eq!(
+            v.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["compaction_id", "min_available_seq"].into_iter().collect(),
+            "§10.12 prune response has exactly the specified members",
+        );
         let (s, v) = c
             .request("GET", &c.path("epochs/0/recovery-envelope"), None, false)
             .await;
