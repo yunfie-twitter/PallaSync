@@ -638,6 +638,33 @@ async fn records_partial_results_immutable_receipts_and_nonce_reuse() {
 }
 
 #[tokio::test]
+async fn v3_request_body_limit_returns_retryable_payload_too_large() {
+    let c = Context::new().await;
+    c.create().await;
+    let path = c.path("records");
+    let maximum = c.state.config.limits()["max_request_bytes"]
+        .as_u64()
+        .unwrap() as usize;
+    let body = format!("{{\"padding\":\"{}\"}}", "A".repeat(maximum));
+    let token = token_for("POST", &path, body.as_bytes(), Some((DEVICE, &key(2))));
+
+    let (status, problem) = c
+        .raw(
+            "POST",
+            &path,
+            body.into_bytes(),
+            Some(&token),
+            VENDOR_MEDIA_TYPE,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{problem}");
+    assert_eq!(problem["code"], "PAYLOAD_TOO_LARGE");
+    assert_eq!(problem["retryable"], true);
+    c.close().await;
+}
+
+#[tokio::test]
 async fn local_recovery_artifacts_in_public_extensions_are_rejected_without_storage() {
     let c = Context::new().await;
     let before = c.create().await;
