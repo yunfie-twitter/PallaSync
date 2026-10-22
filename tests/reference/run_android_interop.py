@@ -130,6 +130,8 @@ def run(args):
         target_relay = stack.enter_context(IsolatedRelay(args.relay_binary)) if args.reseed else None
         if (args.reseed_split_view or args.reseed_pre_capture_write or args.reseed_staging_write) and target_relay is None:
             raise ValueError("reseed split-view/write races require --reseed")
+        if args.reseed_archive_probe and not args.reseed:
+            raise ValueError("--reseed-archive-probe requires --reseed")
         race_scenarios = sum((args.reseed_split_view, args.reseed_pre_capture_write, args.reseed_staging_write))
         if race_scenarios > 1:
             raise ValueError("split-view, staging-write and pre-capture-write are separate scenarios")
@@ -205,7 +207,8 @@ def run(args):
                     "-e","reseed_expect_late_source_write","true" if args.reseed_late_source_write else "false",
                     "-e","reseed_expect_split_view","true" if args.reseed_split_view else "false",
                     "-e","reseed_expect_pre_capture_source_write","true" if args.reseed_pre_capture_write else "false",
-                    "-e","reseed_expect_staging_source_write","true" if args.reseed_staging_write else "false"]
+                    "-e","reseed_expect_staging_source_write","true" if args.reseed_staging_write else "false",
+                    "-e","reseed_archive_probe","true" if args.reseed_archive_probe else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
                 if args.rebase_fault and not resume_after_death:
@@ -468,6 +471,7 @@ if __name__ == "__main__":
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
+    parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")
     parser.add_argument("--reseed-split-view",action="store_true",help="serve one relay-signed contradictory transparency head after target-key acknowledgement and require quarantine without local cutover")
     parser.add_argument("--reseed-pre-capture-write",action="store_true",help="append an independent old-generation record after target key acknowledgement but before the final source capture; require a source-only unimported-edit report")
     parser.add_argument("--reseed-staging-write",action="store_true",help="append an independent old-generation record during target snapshot-part staging and require fail-closed local retention")
