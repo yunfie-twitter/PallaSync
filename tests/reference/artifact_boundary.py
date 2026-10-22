@@ -35,7 +35,7 @@ def require_normal_data(value):
             raise ValueError("C_SCHEMA_VIOLATION")
 
 
-def verify_relay_boundary(http, client, prefix):
+def verify_relay_boundary(http, client, prefix, max_records_per_request=64):
     """Deliberately malformed signed public extensions, with opaque normal ciphertext."""
     import secrets
     import uuid
@@ -52,9 +52,13 @@ def verify_relay_boundary(http, client, prefix):
                   "payload_nonce": b64(secrets.token_bytes(24)), "encrypted_payload": b64(bytes(1040))}
         record["ext"] = {"org.palleria.fixture": {"nested": [{"type": kind}]}}
         records.append(signed(record, client.device, b"PALLASYNC-SYNC-RECORD-v3\0"))
-    status, result, _ = http.request("POST", prefix + "/records", {"records": records})
-    assert status == 200 and result["accepted"] == [] and len(result["rejected"]) == 8, result
-    assert all(item["code"] == "INVALID_FIELD" for item in result["rejected"]), result
+    rejected = []
+    for start in range(0, len(records), max_records_per_request):
+        status, result, _ = http.request("POST", prefix + "/records", {"records": records[start:start + max_records_per_request]})
+        assert status == 200 and result["accepted"] == [], result
+        rejected.extend(result["rejected"])
+    assert len(rejected) == 8, rejected
+    assert all(item["code"] == "INVALID_FIELD" for item in rejected), rejected
     status, after, _ = http.request("GET", prefix + "/log/head", admin=True)
     assert status == 200, after
     assert (before["head_seq"], before["head_hash"]) == (after["head_seq"], after["head_hash"])

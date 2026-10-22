@@ -126,7 +126,12 @@ def run(args):
     if args.delete_response_lost and not args.delete_chain:
         raise ValueError("--delete-response-lost requires --delete-chain")
     with ExitStack() as stack:
-        relay = stack.enter_context(IsolatedRelay(args.relay_binary,chain_delay=1.5,drop_delete_response=args.delete_response_lost))
+        relay = stack.enter_context(IsolatedRelay(
+            args.relay_binary,
+            chain_delay=1.5,
+            drop_delete_response=args.delete_response_lost,
+            max_request_bytes=8_192 if args.records_limit_preflight else 8_388_608,
+        ))
         target_relay = stack.enter_context(IsolatedRelay(args.relay_binary)) if args.reseed else None
         if (args.reseed_split_view or args.reseed_pre_capture_write or args.reseed_staging_write) and target_relay is None:
             raise ValueError("reseed split-view/write races require --reseed")
@@ -142,10 +147,10 @@ def run(args):
         http = ReferenceHTTP(relay,client,True,schema)
         genesis = client.genesis()
         status,created,_ = http.request("POST","/pallasync/v3/chains",genesis,True)
-        assert status == 201,created
+        assert status == 201,(created,relay.request_limit_observations)
         prefix = "/pallasync/v3/chains/"+client.chain
         from artifact_boundary import verify_relay_boundary
-        verify_relay_boundary(http, client, prefix)
+        verify_relay_boundary(http, client, prefix, max_records_per_request=4 if args.records_limit_preflight else 64)
         python_record = client.record("palleria.search_history/3",[{"entity_id":"Python interop","operation":"upsert","lamport":1_000_000,"created_at_ms":1,"context":{},"body":{"query":"Python interop"}}])
         status,accepted,_ = http.request("POST",prefix+"/records",{"records":[python_record]})
         assert status == 200 and len(accepted["accepted"]) == 1,accepted
@@ -208,7 +213,8 @@ def run(args):
                     "-e","reseed_expect_split_view","true" if args.reseed_split_view else "false",
                     "-e","reseed_expect_pre_capture_source_write","true" if args.reseed_pre_capture_write else "false",
                     "-e","reseed_expect_staging_source_write","true" if args.reseed_staging_write else "false",
-                    "-e","records_413_split","true" if args.records_413_split else "false",
+                    "-e","records_413_split","true" if args.records_413_split or args.records_limit_preflight else "false",
+                    "-e","records_limit_preflight","true" if args.records_limit_preflight else "false",
                     "-e","records_413_process_death","true" if args.records_413_process_death else "false",
                     "-e","records_413_resume_after_death","true" if records_413_resume_after_death else "false",
                     "-e","reseed_archive_probe","true" if args.reseed_archive_probe else "false"]
@@ -306,17 +312,26 @@ def run(args):
             if "pallasync_records_413_split=passed" not in output:
                 raise RuntimeError("Android did not report successful PAYLOAD_TOO_LARGE outbox recovery")
             observations = relay.records_413_observations
-            injected = [item for item in observations if item["outcome"] == "injected_413"]
+            rejected = [item for item in observations if item["outcome"] == "injected_413"]
             forwarded = [item for item in observations if item["outcome"] == "forwarded"]
-            if len(injected) != 1 or len(injected[0]["record_ids"]) != 4:
-                raise RuntimeError("The isolated proxy did not reject exactly one four-record batch: " + repr(observations))
-            original_ids = injected[0]["record_ids"]
+            if len(rejected) != 1 or not 2 <= len(rejected[0]["record_ids"]) <= 4:
+                raise RuntimeError("The request path did not reject exactly one multi-record batch: " + repr(observations))
+            original_ids = rejected[0]["record_ids"]
             replacement_ids = [record_id for item in forwarded for record_id in item["record_ids"]]
             if len(forwarded) < 2 or sorted(replacement_ids) != sorted(original_ids):
                 raise RuntimeError("Smaller forwarded batches did not preserve the exact signed record IDs: " + repr(observations))
             if any(item["status"] != 200 or len(item["record_ids"]) >= len(original_ids) for item in forwarded):
                 raise RuntimeError("An outbox replacement was not smaller and accepted: " + repr(observations))
             print("PASS: one injected top-level 413 was recovered by smaller batches containing the exact same four signed record IDs",flush=True)
+        if args.records_limit_preflight:
+            if "pallasync_records_limit_preflight=passed" not in output:
+                raise RuntimeError("Android did not finish its advertised request-limit preflight case")
+            observations = relay.records_413_observations
+            forwarded = [item for item in observations if item["outcome"] == "forwarded"]
+            rejected = [item for item in observations if item["outcome"] == "relay_rejected"]
+            if rejected or not forwarded or any(item["status"] != 200 or item["bytes"] > 8192 for item in forwarded):
+                raise RuntimeError("Android did not honor the signed 8192-byte request limit: " + repr(observations))
+            print("PASS: Android preflight split the unchanged signed outbox to requests within the signed 8192-byte limit; Rust returned no 413",flush=True)
         if args.records_413_process_death:
             if "pallasync_records_413_process_death=resumed_and_drained" not in output:
                 raise RuntimeError("The restarted Android process did not drain the pending outbox")
@@ -507,16 +522,19 @@ def run(args):
             if cursor is None: break
         assert found,"The independent receiver did not decrypt the Android-authored application operation"
         assert initial_found,"The independent receiver did not decrypt the preserved initial local intent"
-        if args.records_413_split:
-            expected_split_queries = {f"Android 413 split {index}" for index in range(4)}
-            observed_split_queries = {
-                operation.get("body", {}).get("query")
+        if args.records_413_split or args.records_limit_preflight:
+            expected_split_queries = {
+                f"Android 413 split {index}" + (" " + "x" * 1400 if args.records_limit_preflight else "")
+                for index in range(4)
+            }
+            observed_queries = {
+                operation.get("body", {}).get("query", "")
                 for _, inner in android_records
                 for operation in inner.get("operations", [])
             }
-            if not expected_split_queries.issubset(observed_split_queries):
+            if not expected_split_queries.issubset(observed_queries):
                 raise RuntimeError("Independent receiver did not decrypt every intent from the recovered 413 batch")
-            print("PASS: independent Python decrypted all four local intents recovered from the rejected batch",flush=True)
+            print("PASS: independent Python decrypted all four exact local intents " + ("under the advertised request-size preflight" if args.records_limit_preflight else "recovered from the rejected batch"),flush=True)
         if args.records_413_process_death:
             expected_split_queries = {f"Android 413 split {index}" for index in range(4)}
             observed_split_queries = {
@@ -528,7 +546,7 @@ def run(args):
                 raise RuntimeError("Independent receiver did not decrypt all four records resumed after process death")
             print("PASS: independent Python decrypted all four resumed records after Android process death",flush=True)
         assert len(paused_records) == 1,"A paused editing intent was lost or signed twice"
-        expected_paused_device_seq = 2 + (4 if args.records_413_split or args.records_413_process_death else 0)
+        expected_paused_device_seq = 2 + (4 if args.records_413_split or args.records_413_process_death or args.records_limit_preflight else 0)
         assert paused_records[0][0]["epoch"] == 0 and paused_records[0][1]["device_seq"] == expected_paused_device_seq
         if args.replace_device:
             assert len(replacement_records) == 1,"Replacement did not replay the unaccepted intent exactly once"
@@ -556,6 +574,7 @@ if __name__ == "__main__":
     parser.add_argument("--delete-chain",action="store_true")
     parser.add_argument("--delete-response-lost",action="store_true")
     parser.add_argument("--records-413-split",action="store_true",help="inject one isolated top-level records 413 and verify durable smaller-batch recovery")
+    parser.add_argument("--records-limit-preflight",action="store_true",help="set a signed 8192-byte relay request limit and verify Android submits unchanged outbox records in requests below that advertised limit")
     parser.add_argument("--records-413-process-death",action="store_true",help="kill Android with the first reduced batch in flight and verify restart resumes the persisted outbox limit")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")

@@ -24,8 +24,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class IsolatedRelay:
-    def __init__(self, binary, chain_delay=0, drop_delete_response=False):
+    def __init__(self, binary, chain_delay=0, drop_delete_response=False, max_request_bytes=8_388_608):
         self.binary = Path(binary).resolve()
+        self.max_request_bytes = max_request_bytes
         self.temporary = tempfile.TemporaryDirectory(prefix="pallasync-reference-")
         self.directory = Path(self.temporary.name)
         self.process = None
@@ -35,6 +36,7 @@ class IsolatedRelay:
         self.records_413_tracking = False
         self.records_413_original_ids = set()
         self.records_413_observations = []
+        self.request_limit_observations = []
         self.records_413_hold_replacement = False
         self.records_413_replacement_received = threading.Event()
         self.records_413_release_replacement = threading.Event()
@@ -55,12 +57,13 @@ class IsolatedRelay:
                 if self.command == "POST" and self.path in {
                     "/__test__/arm-records-413",
                     "/__test__/arm-records-413-process-death",
+                    "/__test__/track-limited-records",
                 }:
                     self.rfile.read(int(self.headers.get("Content-Length",0)))
                     harness.records_413_observations.clear()
                     harness.records_413_original_ids.clear()
                     harness.records_413_tracking = True
-                    harness.records_413_armed = True
+                    harness.records_413_armed = self.path != "/__test__/track-limited-records"
                     harness.records_413_hold_replacement = self.path.endswith("-process-death")
                     harness.records_413_replacement_received.clear()
                     harness.records_413_release_replacement.clear()
@@ -122,10 +125,15 @@ class IsolatedRelay:
                 connection.request(self.command,self.path,body,headers)
                 response = connection.getresponse()
                 payload = response.read(8_388_609)
+                if response.status == 413:
+                    harness.request_limit_observations.append({"path":self.path,"bytes":size,"code":strict_loads(payload).get("code") if payload else None})
                 if record_batch is not None and harness.records_413_tracking:
+                    if response.status == 413 and not harness.records_413_original_ids:
+                        harness.records_413_original_ids = {record["record_id"] for record in record_batch}
                     harness.records_413_observations.append({
-                        "outcome":"forwarded",
+                        "outcome":"forwarded" if response.status < 400 else "relay_rejected",
                         "status":response.status,
+                        "bytes":size,
                         "record_ids":[record["record_id"] for record in record_batch],
                     })
                     observed_ids = {
@@ -205,6 +213,7 @@ class IsolatedRelay:
         markdown = b"# Disposable integration-test operator\nNo production identities or data. Temporary local disk; no backups. TLS 1.2+.\n"
         timestamp = int(time.time()*1000)
         disclosure.update(relay_origin=self.origin,relay_key_id=b64(digest(bytes(self.relay_key.verify_key))),disclosure_id=str(uuid.uuid4()),published_at_ms=timestamp,effective_at_ms=timestamp,markdown_sha256=b64(digest(markdown)))
+        disclosure["limits"]["max_request_bytes"] = self.max_request_bytes
         disclosure["operator"] = {"name":"Disposable test operator","contact_url":self.origin+"/contact"}
         disclosure["change_notice"] = {"minimum_notice_ms":0,"notice_url":self.origin+"/notice","archive_url":self.origin+"/archive"}
         disclosure["quota"]["counted_components"].insert(3,"device_meta")
