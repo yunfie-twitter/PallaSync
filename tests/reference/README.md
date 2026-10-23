@@ -39,7 +39,9 @@ examples; their mocked prior bounds never establish a production checkpoint.
 The isolated runner also verifies exact mnemonic enrollment retries, pending-device restrictions,
 HPKE envelope receipt/commitment and acknowledgement using independent Python crypto.
 `run_android_interop.py` runs one real coordinator/JNI/Room/Keystore enrollment/outbox case on
-only the disposable `PallaSyncV3Conformance` AVD (`emulator-5580`), then independently verifies
+only the disposable `PallaSyncV3Conformance` AVD. It discovers the running emulator serial via
+`adb devices` and `adb emu avd name`, and requires exactly one matching AVD; it does not assume a
+fixed emulator serial. It then independently verifies
 and decrypts its records. It requires freshly built APKs and explicit disposable TLS arguments.
 An absent Android harness argument skips the instrumentation case; it does not mark an IT passed.
 This targeted case is not completion of the 50 three-party IT cases or the Android stress tests.
@@ -61,8 +63,29 @@ accepted source evidence, and constructs fresh records only for unaccepted edits
 Python decrypts both public source ciphertext and accepted replacements, checking new IDs/nonces,
 author sequence, Lamports, exact operation body/context and predecessor links. `--rebase-fault`
 accepts SOURCE_STAGED, DESTINATION_COMMITTED or SOURCE_RETIRED to interrupt the corresponding
-durable boundary. Native sessions end and the OS journal is reopened before resumption. These
-targeted cases do not simulate full Android process death or complete the entire IT catalogue.
+durable rebase boundary. With `--reseed`, it also accepts RESEED_ROOM_COMMITTED,
+RESEED_KEYSTORE_PROMOTED, RESEED_OUTBOX_REBASED, RESEED_ORIGIN_SELECTED or
+RESEED_COMPLETE_COMMITTED to interrupt each journaled cross-store cutover boundary and retry the
+same staged commit. Native sessions end and the OS journal is reopened before resumption. These
+standard boundary retries use the same instrumentation process and do not complete the entire IT
+catalogue; `--rebase-process-death` separately verifies fresh-process recovery for the five reseed
+cutover boundaries. A successful `--reseed` case also explicitly replays the retired source after cutover and requires
+the Android coordinator to report a verified empty suffix.
+
+The `--reseed --rebase-fault` cutover path has passed against the disposable AVD for all five
+durable boundaries (`RESEED_ROOM_COMMITTED`, `RESEED_KEYSTORE_PROMOTED`,
+`RESEED_OUTBOX_REBASED`, `RESEED_ORIGIN_SELECTED`, and `RESEED_COMPLETE_COMMITTED`), plus a
+no-fault cutover. Adding `--rebase-process-death` kills instrumentation after the selected
+boundary, then starts a fresh process against the test-only file-backed Room database and
+persistent Android Keystore state. All five process-death resumes passed. These targeted runs do
+not prove late-writer/split-view reconciliation or the full relay-migration catalogue.
+
+`--rebase-fault RESEED_SOURCE_CAPTURED --rebase-process-death --reseed-late-source-write` injects
+one valid Python device record into the old generation after Android durably captures its final
+source report and the app process exits. Android must resume cutover from the saved report, then
+report exactly one unimported edit; Python verifies that the record remains on the source and is
+absent from the target. This precise race case passed. Other concurrent-write timings and signed
+split-view/fork response cases remain unverified.
 
 `run_legacy_interop.py --relay-binary PATH` injects a frozen legacy fixture only into its own
 disposable SQLite file. Independent Python derives the v2.1 keys and verifies original device
@@ -109,3 +132,25 @@ processing for future Android interoperability. It caches encrypted transfers an
 never decrypted payloads. It validates payload schemas and literal §19 result codes, aborts invalid
 sessions and preserves only an authenticated sequence gap for retry. Callers validate known set status and holder/root
 authorization; unit crypto success does not certify the full recovery state machine or UI.
+
+`run_android_interop.py --delete-chain --delete-response-lost` commits an admin DELETE on the isolated relay and closes only that request's HTTP response. Android must retain its chain while proof is unavailable, then reuse its exact saved signed request after retry backoff, verify GET `/deletion`, and erase only after proof/bundle readback and explicit confirmation. The disposable AVD run passed in 133.415 seconds; physical SAF and the broader deletion fault catalogue remain outside this case.
+
+`run_android_interop.py --reseed --reseed-split-view` arms a one-shot source-relay response after the target device key acknowledgement. The proxy changes `head_hash` in the signed transparency head and re-signs the complete object with the isolated relay's published test key; it does not alter production code or use a forged/invalid signature. Android must reject local origin cutover, quarantine the exact signed contradictory head, pause source writes and retain the source authority/keys. The 2026-10-19 dedicated `PallaSyncV3Conformance` AVD run passed in 148.238 seconds with error `C_LOG_HASH_MISMATCH` and `write_state=integrity_paused`; the runner independently confirmed the target relay had reached generation 1 while the client remained on source generation 0. This covers the same-sequence signed data-head contradiction at the post-target-commit/pre-local-cutover boundary only; other split-view timings and physical relay-migration scenarios remain unverified. Protocol basis: §§11.5, 17.3, 17.5–17.6, 17.9–17.10.
+
+`run_android_interop.py --reseed --reseed-pre-capture-write` injects an independently device-signed, accepted generation-0 record at the target device-key acknowledgement boundary, before Android's final source replay. The dedicated AVD run passed in 165.47 seconds: Android completed generation+1 cutover and reported one unimported edit; the independent runner verified that record on the source relay and absent from the target. This complements `--reseed-late-source-write`, which injects after the durable final source report and resumes in a fresh app process. Neither case covers writers during earlier snapshot staging or every concurrent schedule. Protocol basis: §§11.5, 17.5–17.6.
+
+`run_android_interop.py --reseed --reseed-staging-write` injects an independent source write immediately after the target accepts a snapshot part. The Android client must detect the changed source head before sending the generation commit, retain a source-conflict report, and after explicit source synchronization rebuild the snapshot under a fresh compaction ID. The journal reset is limited to a proven uncommitted snapshot; no commit result or transparency proof may exist, and accepted old parts remain retained. The 2026-10-19 dedicated AVD run passed (AndroidJUnitRunner `OK (1 test)`, 199.103 seconds). Independent Python derived the target epoch secret from the signed recovery envelope, verified the signed compaction and part hashes/signatures, decrypted the snapshot, and found the racing source entity; it also confirmed the original signed source record was not copied verbatim into the target event log. This covers one injected snapshot-staging interleaving, not arbitrary simultaneous writers or the complete A-27 catalogue. Protocol basis: §§7.8, 10.11–10.12, 16.6, 17.5–17.6, 17.9.
+
+`run_android_interop.py --records-413-split` injects one valid protocol `PAYLOAD_TOO_LARGE` response at a test-only HTTPS proxy endpoint, then observes the coordinator's retries. It requires the exact four original record IDs to be accepted in smaller batches and the independent Python receiver to decrypt all four operations. The proxy fault endpoint exists only in this disposable test harness; it is not part of the relay API. This case does not exercise process restart during reduced-batch retry or a request rejected by the actual Rust server limit.
+
+`run_android_interop.py --records-413-process-death` also tests durable recovery: after the proxy injects `PAYLOAD_TOO_LARGE`, it holds the first smaller two-record POST; the runner force-stops Android before forwarding that request, starts a fresh instrumentation process against the same persistent Room database, and verifies that the encrypted per-chain limit remains 2 and all original records drain in two accepted batches. The proxy verifies the held request was never accepted, and independent Python decrypts all four records. This remains an isolated client test; it does not simulate an actual Rust-server size rejection or one-record overflow.
+
+The Rust relay integration test `v3_request_body_limit_returns_retryable_payload_too_large` separately sends a correctly token-bound JSON body larger than the relay's advertised `max_request_bytes` through the real v3 router and asserts HTTP 413 with retryable `PAYLOAD_TOO_LARGE`. It covers the server boundary independently; it does not combine the actual server rejection with Android's persisted retry flow.
+
+`run_android_interop.py --records-limit-preflight` signs and serves an isolated disclosure advertising an 8192-byte request limit, configures the Rust relay to enforce the same value, and queues four large but valid search-history intents through the real Android coordinator. The harness verifies each records POST reaching the Rust server stays within that limit, while the independent Python receiver verifies signatures/AEAD and matches every decrypted query to its full expected value. The matching limit is intentionally enforced before the relay needs to reject a request; this mode tests client preflight, not the 413 retry path. The proxy-injected 413 modes above remain separate retry/restart tests.
+
+`run_android_interop.py --records-413-single` injects one protocol-shaped 413 for a single immutable `/records` request. The Android coordinator must preserve the exact Room outbox row, keep its pending count at one, and retain the `PAYLOAD_TOO_LARGE` blocker without retrying an identical body. The harness verifies a single injected record ID and no replacement POST; the independent client still verifies the baseline accepted Android synchronization. This test proves safe retention only: no protocol-level split of a signed record is possible, and the 413 is generated by the disposable HTTPS proxy rather than the Rust relay. Protocol basis: §§10.6, 11.1, 17.8, 19.2.
+
+`run_android_interop.py --rotate-epoch` arms a one-shot test-only proxy response for the Android's two queued records: the proxy returns HTTP 200 using `application/vnd.palleria.sync.v3+json`, with exact per-item `409 EPOCH_STALE` results and the latest relay parameters checkpoint. Android must validate the response through Rust JNI, persist the deferred state in Room, perform the authorized epoch rotation/rebase, and upload replacements without resending either stale record ID. The independent Python receiver verifies each replacement signature, AEAD, operation payload and predecessor link. This is response-path fault injection, not a second-device concurrency simulation; the proxy-generated rejection does not itself prove that a real relay race produced the condition. Protocol basis: §§0, 10.6, 11.1, 17.8, 19.2.
+
+`run_android_interop.py --cursor-expired` serves a signed privacy disclosure with `page_limit=1`, then injects one retryable `409 CURSOR_EXPIRED` on a later device-registry page. The harness requires Android to complete initial sync after the injected failure; successful enrollment and `initialPullCompleted` are reported only after registry fetch returns successfully. The response is generated only by the disposable HTTPS test proxy. Protocol basis: §§10.9, 17.9, 19.2.

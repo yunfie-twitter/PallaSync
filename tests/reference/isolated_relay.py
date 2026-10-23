@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from urllib.parse import parse_qs, urlsplit
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
@@ -24,11 +25,37 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class IsolatedRelay:
-    def __init__(self, binary, chain_delay=0):
+    def __init__(self, binary, chain_delay=0, drop_delete_response=False, max_request_bytes=8_388_608, page_limit=1000):
         self.binary = Path(binary).resolve()
+        self.max_request_bytes = max_request_bytes
+        self.page_limit = page_limit
         self.temporary = tempfile.TemporaryDirectory(prefix="pallasync-reference-")
         self.directory = Path(self.temporary.name)
         self.process = None
+        self.drop_delete_response = drop_delete_response
+        self.split_view_next_transparency_head = False
+        self.records_413_armed = False
+        self.records_413_tracking = False
+        self.records_413_original_ids = set()
+        self.records_413_observations = []
+        self.request_limit_observations = []
+        self.records_413_hold_replacement = False
+        self.records_413_replacement_received = threading.Event()
+        self.records_413_release_replacement = threading.Event()
+        self.receipt_not_found_armed = False
+        self.receipt_not_found_tracking = False
+        self.receipt_not_found_observations = []
+        self.epoch_stale_armed = False
+        self.epoch_stale_tracking = False
+        self.epoch_stale_parameters = {}
+        self.epoch_stale_observations = []
+        self.cursor_expired_armed = False
+        self.cursor_expired_tracking = False
+        self.cursor_expired_path = None
+        self.cursor_expired_route = None
+        self.cursor_expired_observations = []
+        self.on_keys_ack = None
+        self.on_snapshot_part = None
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
         reserve = socket.socket()
         reserve.bind(("127.0.0.1",0))
@@ -41,6 +68,75 @@ class IsolatedRelay:
                 pass
 
             def forward(self):
+                if self.command == "POST" and self.path in {
+                    "/__test__/arm-records-413",
+                    "/__test__/arm-records-413-process-death",
+                    "/__test__/track-limited-records",
+                }:
+                    self.rfile.read(int(self.headers.get("Content-Length",0)))
+                    harness.records_413_observations.clear()
+                    harness.records_413_original_ids.clear()
+                    harness.records_413_tracking = True
+                    harness.records_413_armed = self.path != "/__test__/track-limited-records"
+                    harness.records_413_hold_replacement = self.path.endswith("-process-death")
+                    harness.records_413_replacement_received.clear()
+                    harness.records_413_release_replacement.clear()
+                    payload = b'{"armed":true}'
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                if self.command == "POST" and self.path == "/__test__/arm-receipt-not-found":
+                    self.rfile.read(int(self.headers.get("Content-Length",0)))
+                    harness.receipt_not_found_armed = True
+                    harness.receipt_not_found_tracking = True
+                    harness.receipt_not_found_observations.clear()
+                    payload = b'{"armed":true}'
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                if self.command == "POST" and self.path == "/__test__/arm-epoch-stale":
+                    self.rfile.read(int(self.headers.get("Content-Length",0)))
+                    harness.epoch_stale_armed = True
+                    harness.epoch_stale_tracking = True
+                    harness.epoch_stale_observations.clear()
+                    chain = self.headers.get("X-Test-Chain-Id")
+                    metadata = harness.epoch_stale_parameters.get(chain)
+                    payload = jcs({"armed":True,"metadata":metadata})
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                if self.command == "GET" and harness.cursor_expired_armed:
+                    parsed_path = urlsplit(self.path)
+                    query = parse_qs(parsed_path.query, strict_parsing=False)
+                    if parsed_path.path.startswith("/pallasync/v3/chains/") and parsed_path.path.endswith("/devices") and query.get("cursor"):
+                        harness.cursor_expired_armed = False
+                        harness.cursor_expired_tracking = True
+                        harness.cursor_expired_path = self.path
+                        harness.cursor_expired_route = parsed_path.path
+                        harness.cursor_expired_observations.append({"outcome":"injected_409","method":self.command,"path":self.path})
+                        payload = jcs({
+                            "type":"about:blank",
+                            "title":"Cursor Expired",
+                            "status":409,
+                            "code":"CURSOR_EXPIRED",
+                            "retryable":True,
+                            "server_time_ms":int(time.time()*1000),
+                        })
+                        self.send_response(409)
+                        self.send_header("Content-Type","application/problem+json")
+                        self.send_header("Content-Length",str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                 # Integration clients revalidate public documents before every request.
                 # Pace this test transport within the unchanged disclosed rate ceilings.
                 if chain_delay and self.path.startswith("/pallasync/v3/chains"):
@@ -50,11 +146,183 @@ class IsolatedRelay:
                     self.send_error(413)
                     return
                 body = self.rfile.read(size)
+                is_receipt_lookup = (
+                    self.command == "GET"
+                    and self.path.split("?",1)[0].startswith("/pallasync/v3/chains/")
+                    and "/receipts/" in self.path.split("?",1)[0]
+                )
+                if is_receipt_lookup and harness.receipt_not_found_armed:
+                    harness.receipt_not_found_armed = False
+                    harness.receipt_not_found_observations.append({"outcome":"injected_404","method":self.command,"path":self.path})
+                    payload = jcs({
+                        "type":"about:blank",
+                        "title":"Receipt Not Found",
+                        "status":404,
+                        "code":"RECEIPT_NOT_FOUND",
+                        "retryable":True,
+                        "server_time_ms":int(time.time()*1000),
+                    })
+                    self.send_response(404)
+                    self.send_header("Content-Type","application/problem+json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                record_batch = None
+                if self.command == "POST" and self.path.endswith("/records"):
+                    parsed = strict_loads(body)
+                    record_batch = parsed.get("records") if isinstance(parsed,dict) else None
+                    if not isinstance(record_batch,list):
+                        raise ValueError("isolated records request did not contain a records array")
+                    if harness.epoch_stale_armed:
+                        harness.epoch_stale_armed = False
+                        chain = self.path.split("/",5)[4]
+                        metadata = harness.epoch_stale_parameters.get(chain)
+                        if not isinstance(metadata,dict):
+                            harness.epoch_stale_observations.append({"outcome":"missing_parameters","path":self.path})
+                            raise ValueError("cannot inject EPOCH_STALE without a previously observed parameters checkpoint")
+                        response_body = jcs({
+                            "accepted":[],
+                            "rejected":[
+                                {"record_id":record["record_id"],"status":409,"code":"EPOCH_STALE","retryable":True}
+                                for record in record_batch
+                            ],
+                            "upload_receipts":[],
+                            **metadata,
+                        })
+                        harness.epoch_stale_observations.append({
+                            "outcome":"injected_per_item_409",
+                            "path":self.path,
+                            "record_ids":[record["record_id"] for record in record_batch],
+                            "submitted_generations":[record.get("generation") for record in record_batch],
+                            "metadata":metadata,
+                            "response_body":strict_loads(response_body),
+                            "status":200,
+                        })
+                        self.send_response(200)
+                        self.send_header("Content-Type","application/vnd.palleria.sync.v3+json")
+                        self.send_header("Content-Length",str(len(response_body)))
+                        self.end_headers()
+                        self.wfile.write(response_body)
+                        return
+                    if harness.records_413_armed:
+                        harness.records_413_armed = False
+                        harness.records_413_original_ids = {record["record_id"] for record in record_batch}
+                        harness.records_413_observations.append({
+                            "outcome":"injected_413",
+                            "record_ids":[record["record_id"] for record in record_batch],
+                        })
+                        payload = jcs({
+                            "type":"about:blank",
+                            "title":"Payload Too Large",
+                            "status":413,
+                            "code":"PAYLOAD_TOO_LARGE",
+                            "retryable":True,
+                            "server_time_ms":int(time.time()*1000),
+                        })
+                        self.send_response(413)
+                        self.send_header("Content-Type","application/problem+json")
+                        self.send_header("Content-Length",str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
+                    if harness.records_413_hold_replacement:
+                        harness.records_413_hold_replacement = False
+                        harness.records_413_observations.append({
+                            "outcome":"held_replacement",
+                            "record_ids":[record["record_id"] for record in record_batch],
+                        })
+                        harness.records_413_replacement_received.set()
+                        harness.records_413_release_replacement.wait(120)
+                        self.close_connection = True
+                        return
                 connection = http.client.HTTPConnection("127.0.0.1",harness.backend_port,timeout=10)
                 headers = {name:value for name,value in self.headers.items() if name.lower() not in {"host","connection","content-length"}}
                 connection.request(self.command,self.path,body,headers)
                 response = connection.getresponse()
                 payload = response.read(8_388_609)
+                if (response.status == 200 and self.command == "GET"
+                        and self.path.split("?",1)[0].endswith("/parameters")):
+                    value = strict_loads(payload)
+                    chain = self.path.split("/",5)[4]
+                    harness.epoch_stale_parameters[chain] = {
+                        "generation":value["generation"],
+                        "log_id":value["log_id"],
+                        "head_seq":value["head_seq"],
+                        "head_hash":value["head_hash"],
+                    }
+                if record_batch is not None and harness.epoch_stale_tracking:
+                    harness.epoch_stale_observations.append({
+                        "outcome":"forwarded",
+                        "path":self.path,
+                        "record_ids":[record["record_id"] for record in record_batch],
+                        "status":response.status,
+                    })
+                if is_receipt_lookup and harness.receipt_not_found_tracking:
+                    harness.receipt_not_found_observations.append({
+                        "outcome":"forwarded",
+                        "method":self.command,
+                        "path":self.path,
+                        "status":response.status,
+                    })
+                    if len(harness.receipt_not_found_observations) >= 2:
+                        harness.receipt_not_found_tracking = False
+                if (harness.cursor_expired_tracking and self.command == "GET"
+                        and urlsplit(self.path).path == harness.cursor_expired_route
+                        and not parse_qs(urlsplit(self.path).query).get("cursor")):
+                    harness.cursor_expired_observations.append({
+                        "outcome":"restarted_from_first_page",
+                        "method":self.command,
+                        "path":self.path,
+                        "status":response.status,
+                    })
+                    if response.status == 200:
+                        harness.cursor_expired_tracking = False
+                if response.status == 413:
+                    harness.request_limit_observations.append({"path":self.path,"bytes":size,"code":strict_loads(payload).get("code") if payload else None})
+                if record_batch is not None and harness.records_413_tracking:
+                    if response.status == 413 and not harness.records_413_original_ids:
+                        harness.records_413_original_ids = {record["record_id"] for record in record_batch}
+                    harness.records_413_observations.append({
+                        "outcome":"forwarded" if response.status < 400 else "relay_rejected",
+                        "status":response.status,
+                        "bytes":size,
+                        "record_ids":[record["record_id"] for record in record_batch],
+                    })
+                    observed_ids = {
+                        record_id
+                        for item in harness.records_413_observations
+                        if item["outcome"] == "forwarded"
+                        for record_id in item["record_ids"]
+                    }
+                    if harness.records_413_original_ids.issubset(observed_ids):
+                        harness.records_413_tracking = False
+                if response.status == 200 and self.command == "POST" and self.path.endswith("/keys/ack"):
+                    callback = harness.on_keys_ack
+                    if callback is not None:
+                        callback()
+                if response.status == 200 and self.command == "POST" and self.path.endswith("/snapshots/parts"):
+                    callback = harness.on_snapshot_part
+                    if callback is not None:
+                        callback()
+                if (
+                    response.status == 200
+                    and self.command == "GET"
+                    and self.path.endswith("/transparency/head")
+                    and harness.split_view_next_transparency_head
+                ):
+                    harness.split_view_next_transparency_head = False
+                    value = strict_loads(payload)
+                    head = value["head"]
+                    head["head_hash"] = b64(digest(b"Palleria isolated signed split-view test"))
+                    value["head"] = signed(head, harness.relay_key, b"PALLASYNC-TRANSPARENCY-HEAD-v3\0", "relay_signature")
+                    payload = jcs(value)
+                if (harness.drop_delete_response and self.command == "DELETE"
+                        and self.path.startswith("/pallasync/v3/chains/") and self.path.count("/") == 4):
+                    harness.drop_delete_response = False
+                    connection.close()
+                    self.close_connection = True
+                    return
                 self.send_response(response.status)
                 for name,value in response.getheaders():
                     if name.lower() not in {"transfer-encoding","connection","content-length","date","server"}:
@@ -98,6 +366,8 @@ class IsolatedRelay:
         markdown = b"# Disposable integration-test operator\nNo production identities or data. Temporary local disk; no backups. TLS 1.2+.\n"
         timestamp = int(time.time()*1000)
         disclosure.update(relay_origin=self.origin,relay_key_id=b64(digest(bytes(self.relay_key.verify_key))),disclosure_id=str(uuid.uuid4()),published_at_ms=timestamp,effective_at_ms=timestamp,markdown_sha256=b64(digest(markdown)))
+        disclosure["limits"]["max_request_bytes"] = self.max_request_bytes
+        disclosure["limits"]["page_limit"] = self.page_limit
         disclosure["operator"] = {"name":"Disposable test operator","contact_url":self.origin+"/contact"}
         disclosure["change_notice"] = {"minimum_notice_ms":0,"notice_url":self.origin+"/notice","archive_url":self.origin+"/archive"}
         disclosure["quota"]["counted_components"].insert(3,"device_meta")

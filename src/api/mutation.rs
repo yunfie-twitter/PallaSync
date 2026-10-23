@@ -534,7 +534,7 @@ pub async fn prune(
         .await
         .map_err(|_| err("COMPACTION_UNSAFE"))?;
     // Admin-signed pruning attests client semantic verification. Relay checks opaque coverage and preserves all authority evidence.
-    let (_, r) = store::append(&mut *db, c, cfg, "admin", op).await?;
+    let _ = store::append(&mut *db, c, cfg, "admin", op).await?;
     sqlx::query("UPDATE v3_objects SET body=NULL WHERE chain_id=? AND kind='record' AND log_id=? AND relay_seq<=?").bind(&c.chain_id).bind(&c.log_id).bind(through as i64).execute(&mut *db).await?;
     sqlx::query("UPDATE v3_log SET entry=NULL WHERE chain_id=? AND log_id=? AND seq<=? AND json_extract(entry,'$.kind')='record'").bind(&c.chain_id).bind(&c.log_id).bind(through as i64).execute(&mut *db).await?;
     c.min_available_seq = through + 1;
@@ -550,7 +550,8 @@ pub async fn prune(
         None,
     )
     .await?;
-    let response = json!({"min_available_seq":c.min_available_seq,"compaction_id":v["compaction_id"],"upload_receipts":[r]});
+    let response =
+        json!({"min_available_seq":c.min_available_seq,"compaction_id":v["compaction_id"]});
     store::outcome(db, &c.chain_id, "prune", id, v, &response).await?;
     Ok(response)
 }

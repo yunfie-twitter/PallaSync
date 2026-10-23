@@ -638,6 +638,33 @@ async fn records_partial_results_immutable_receipts_and_nonce_reuse() {
 }
 
 #[tokio::test]
+async fn v3_request_body_limit_returns_retryable_payload_too_large() {
+    let c = Context::new().await;
+    c.create().await;
+    let path = c.path("records");
+    let maximum = c.state.config.limits()["max_request_bytes"]
+        .as_u64()
+        .unwrap() as usize;
+    let body = format!("{{\"padding\":\"{}\"}}", "A".repeat(maximum));
+    let token = token_for("POST", &path, body.as_bytes(), Some((DEVICE, &key(2))));
+
+    let (status, problem) = c
+        .raw(
+            "POST",
+            &path,
+            body.into_bytes(),
+            Some(&token),
+            VENDOR_MEDIA_TYPE,
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{problem}");
+    assert_eq!(problem["code"], "PAYLOAD_TOO_LARGE");
+    assert_eq!(problem["retryable"], true);
+    c.close().await;
+}
+
+#[tokio::test]
 async fn local_recovery_artifacts_in_public_extensions_are_rejected_without_storage() {
     let c = Context::new().await;
     let before = c.create().await;
@@ -789,6 +816,17 @@ async fn snapshots_transparency_pagination_and_pruning_preserve_id_evidence() {
     let op = admin(&genesis, "prune_log", &target);
     let (s,v)=c.request("POST",&c.path("log/prune"),Some(&json!({"compaction_id":comp["compaction_id"],"through_seq":6,"admin_operation":op})),false).await;
     assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v.as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["compaction_id", "min_available_seq"].into_iter().collect(),
+        "§10.12 prune response has exactly the specified members",
+    );
+    assert_eq!(v["compaction_id"], comp["compaction_id"]);
+    assert_eq!(v["min_available_seq"], 7);
     let (_, v) = c
         .request(
             "GET",
@@ -1312,6 +1350,96 @@ async fn import_reseed_installs_fresh_pending_members_and_preserves_source_autho
 }
 
 #[tokio::test]
+async fn import_accepts_consecutive_history_chunks_with_a_fixed_terminal_head() {
+    let source = Context::new().await;
+    source.create().await;
+    let base = config(None);
+    let mut privacy = base.privacy.clone();
+    privacy["relay_origin"] = "https://target.example.com".into();
+    privacy["relay_key_id"] = hash_bytes(key(161).verifying_key().as_bytes()).into();
+    sign_relay(&key(161), &mut privacy, CTX_PRIVACY).unwrap();
+    let target = Context::configured(
+        RelayConfig::new(key(161), (*base.markdown).clone(), privacy, None).unwrap(),
+    )
+    .await;
+
+    let p0 = source.genesis["parameters"].clone();
+    let mut p1 = p0.clone();
+    p1["generation"] = 1.into();
+    p1["previous_parameters_hash"] = object_hash(&p0).into();
+    let p1 = sign(p1, &key(1), CTX_PARAMETERS);
+    let mut p2 = p1.clone();
+    p2["generation"] = 2.into();
+    p2["previous_parameters_hash"] = object_hash(&p1).into();
+    let p2 = sign(p2, &key(1), CTX_PARAMETERS);
+    let fixed_epoch = source.genesis["epoch"].clone();
+    let other = json!({
+        "epoch_history": [fixed_epoch],
+        "device_history": [source.genesis["device_record"]],
+        "envelopes": source.genesis["envelopes"],
+        "compactions": [],
+    });
+
+    let mut first = other.clone();
+    first["parameters_history"] = json!([p0.clone(), p2.clone()]);
+    let (status, staged_first) = target
+        .request("POST", "/pallasync/v3/chains/import", Some(&first), false)
+        .await;
+    assert_eq!(status, 202, "{staged_first}");
+
+    let mut second = other;
+    second["parameters_history"] = json!([p1, p2]);
+    let (status, staged_second) = target
+        .request("POST", "/pallasync/v3/chains/import", Some(&second), false)
+        .await;
+    assert_eq!(status, 202, "{staged_second}");
+    assert_eq!(staged_first["log_id"], staged_second["log_id"]);
+    target.close().await;
+
+    let mut bad_privacy = base.privacy.clone();
+    bad_privacy["relay_origin"] = "https://target.example.com".into();
+    bad_privacy["relay_key_id"] = hash_bytes(key(161).verifying_key().as_bytes()).into();
+    sign_relay(&key(161), &mut bad_privacy, CTX_PRIVACY).unwrap();
+    let bad_target = Context::configured(
+        RelayConfig::new(key(161), (*base.markdown).clone(), bad_privacy, None).unwrap(),
+    )
+    .await;
+    let mut invalid_head = p1.clone();
+    invalid_head["generation"] = 2.into();
+    invalid_head["previous_parameters_hash"] = object_hash(&p0).into();
+    let invalid_head = sign(invalid_head, &key(1), CTX_PARAMETERS);
+    let mut invalid_first = json!({
+        "parameters_history": [p0, invalid_head.clone()],
+        "epoch_history": [source.genesis["epoch"]],
+        "device_history": [source.genesis["device_record"]],
+        "envelopes": source.genesis["envelopes"],
+        "compactions": [],
+    });
+    let (status, _) = bad_target
+        .request(
+            "POST",
+            "/pallasync/v3/chains/import",
+            Some(&invalid_first),
+            false,
+        )
+        .await;
+    assert_eq!(status, 202);
+    invalid_first["parameters_history"] = json!([p1, invalid_head]);
+    let (status, response) = bad_target
+        .request(
+            "POST",
+            "/pallasync/v3/chains/import",
+            Some(&invalid_first),
+            false,
+        )
+        .await;
+    assert_eq!(status, 409, "{response}");
+    assert_eq!(response["code"], "IMPORT_CONFLICT");
+    bad_target.close().await;
+    source.close().await;
+}
+
+#[tokio::test]
 async fn policy_signature_schema_limits_and_restart_barrier_are_enforced() {
     let base = config(None);
     let mut invalid = base.privacy.clone();
@@ -1451,6 +1579,15 @@ async fn old_envelopes_expire_only_after_current_snapshot_and_admin_handoff() {
             .request("POST", &c.path("log/prune"), Some(&body), false)
             .await;
         assert_eq!(s, 200, "{v}");
+        assert_eq!(
+            v.as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["compaction_id", "min_available_seq"].into_iter().collect(),
+            "§10.12 prune response has exactly the specified members",
+        );
         let (s, v) = c
             .request("GET", &c.path("epochs/0/recovery-envelope"), None, false)
             .await;
