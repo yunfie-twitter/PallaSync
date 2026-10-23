@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from urllib.parse import parse_qs, urlsplit
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes, serialization
@@ -24,9 +25,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class IsolatedRelay:
-    def __init__(self, binary, chain_delay=0, drop_delete_response=False, max_request_bytes=8_388_608):
+    def __init__(self, binary, chain_delay=0, drop_delete_response=False, max_request_bytes=8_388_608, page_limit=1000):
         self.binary = Path(binary).resolve()
         self.max_request_bytes = max_request_bytes
+        self.page_limit = page_limit
         self.temporary = tempfile.TemporaryDirectory(prefix="pallasync-reference-")
         self.directory = Path(self.temporary.name)
         self.process = None
@@ -47,6 +49,11 @@ class IsolatedRelay:
         self.epoch_stale_tracking = False
         self.epoch_stale_parameters = {}
         self.epoch_stale_observations = []
+        self.cursor_expired_armed = False
+        self.cursor_expired_tracking = False
+        self.cursor_expired_path = None
+        self.cursor_expired_route = None
+        self.cursor_expired_observations = []
         self.on_keys_ack = None
         self.on_snapshot_part = None
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
@@ -107,6 +114,29 @@ class IsolatedRelay:
                     self.end_headers()
                     self.wfile.write(payload)
                     return
+                if self.command == "GET" and harness.cursor_expired_armed:
+                    parsed_path = urlsplit(self.path)
+                    query = parse_qs(parsed_path.query, strict_parsing=False)
+                    if parsed_path.path.startswith("/pallasync/v3/chains/") and parsed_path.path.endswith("/devices") and query.get("cursor"):
+                        harness.cursor_expired_armed = False
+                        harness.cursor_expired_tracking = True
+                        harness.cursor_expired_path = self.path
+                        harness.cursor_expired_route = parsed_path.path
+                        harness.cursor_expired_observations.append({"outcome":"injected_409","method":self.command,"path":self.path})
+                        payload = jcs({
+                            "type":"about:blank",
+                            "title":"Cursor Expired",
+                            "status":409,
+                            "code":"CURSOR_EXPIRED",
+                            "retryable":True,
+                            "server_time_ms":int(time.time()*1000),
+                        })
+                        self.send_response(409)
+                        self.send_header("Content-Type","application/problem+json")
+                        self.send_header("Content-Length",str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                 # Integration clients revalidate public documents before every request.
                 # Pace this test transport within the unchanged disclosed rate ceilings.
                 if chain_delay and self.path.startswith("/pallasync/v3/chains"):
@@ -237,6 +267,17 @@ class IsolatedRelay:
                     })
                     if len(harness.receipt_not_found_observations) >= 2:
                         harness.receipt_not_found_tracking = False
+                if (harness.cursor_expired_tracking and self.command == "GET"
+                        and urlsplit(self.path).path == harness.cursor_expired_route
+                        and not parse_qs(urlsplit(self.path).query).get("cursor")):
+                    harness.cursor_expired_observations.append({
+                        "outcome":"restarted_from_first_page",
+                        "method":self.command,
+                        "path":self.path,
+                        "status":response.status,
+                    })
+                    if response.status == 200:
+                        harness.cursor_expired_tracking = False
                 if response.status == 413:
                     harness.request_limit_observations.append({"path":self.path,"bytes":size,"code":strict_loads(payload).get("code") if payload else None})
                 if record_batch is not None and harness.records_413_tracking:
@@ -326,6 +367,7 @@ class IsolatedRelay:
         timestamp = int(time.time()*1000)
         disclosure.update(relay_origin=self.origin,relay_key_id=b64(digest(bytes(self.relay_key.verify_key))),disclosure_id=str(uuid.uuid4()),published_at_ms=timestamp,effective_at_ms=timestamp,markdown_sha256=b64(digest(markdown)))
         disclosure["limits"]["max_request_bytes"] = self.max_request_bytes
+        disclosure["limits"]["page_limit"] = self.page_limit
         disclosure["operator"] = {"name":"Disposable test operator","contact_url":self.origin+"/contact"}
         disclosure["change_notice"] = {"minimum_notice_ms":0,"notice_url":self.origin+"/notice","archive_url":self.origin+"/archive"}
         disclosure["quota"]["counted_components"].insert(3,"device_meta")

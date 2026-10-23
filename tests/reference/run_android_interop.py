@@ -92,6 +92,22 @@ def verify_reseed_snapshot_contains(remote, client, prefix, parameters, new_devi
     raise RuntimeError("Committed target snapshot does not contain the racing source entity")
 
 
+def fetch_all_pages(remote, path, admin, limit):
+    cursor = None
+    items = []
+    last = None
+    while True:
+        request_path = path + f"?limit={limit}" + ("&cursor=" + cursor if cursor else "")
+        status, page, _ = remote.request("GET", request_path, admin=admin)
+        if status != 200:
+            raise RuntimeError(f"Could not fetch paginated {path}: {status} {page}")
+        items.extend(page["items"])
+        cursor = page["next_cursor"]
+        last = page
+        if cursor is None:
+            return {**last, "items": items, "next_cursor": None}
+
+
 def run(args):
     listed = subprocess.run([args.adb,"devices"],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=30)
     if listed.returncode != 0:
@@ -132,6 +148,7 @@ def run(args):
             chain_delay=1.5,
             drop_delete_response=args.delete_response_lost,
             max_request_bytes=8_192 if args.records_limit_preflight else 8_388_608,
+            page_limit=1 if args.cursor_expired else 1000,
         ))
         target_relay = stack.enter_context(IsolatedRelay(args.relay_binary)) if args.reseed else None
         if (args.reseed_split_view or args.reseed_pre_capture_write or args.reseed_staging_write) and target_relay is None:
@@ -196,6 +213,11 @@ def run(args):
             handoff = AndroidPeerHandoff(args.adb,str(uuid.uuid4()),relay,client,genesis,schema,created["log_id"])
             handoff.thread.start()
         try:
+            if args.cursor_expired:
+                incompatible = args.rotate_epoch or args.replace_device or args.peer_enrollment or args.delete_chain or args.reseed
+                if incompatible:
+                    raise ValueError("--cursor-expired is a standalone device-registry paging scenario")
+                relay.cursor_expired_armed = True
             relay_cert = (relay.directory/"tls.pem").read_bytes()
             if target_relay is not None:
                 relay_cert += (target_relay.directory/"tls.pem").read_bytes()
@@ -213,6 +235,7 @@ def run(args):
                     "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
                     "-e","relay_ca_base64",base64.b64encode(relay_cert).decode(),
                     "-e","rotate_epoch","true" if args.rotate_epoch else "false",
+                    "-e","cursor_expired","true" if args.cursor_expired else "false",
                     "-e","replace_device","true" if args.replace_device else "false",
                     "-e","delete_chain","true" if args.delete_chain else "false",
                     "-e","delete_response_lost","true" if args.delete_response_lost else "false",
@@ -359,6 +382,8 @@ def run(args):
                 adb("reverse","--remove",f"tcp:{target_relay.proxy.server_port}")
         print(output[-6000:],flush=True)
         if not re.search(r"OK \(1 test\)",output):
+            if args.cursor_expired:
+                print("CURSOR EXPIRED OBSERVATIONS",repr(relay.cursor_expired_observations),flush=True)
             if args.receipt_not_found:
                 print("RECEIPT NOT FOUND OBSERVATIONS",repr(relay.receipt_not_found_observations),flush=True)
             if args.rotate_epoch and not args.replace_device:
@@ -441,6 +466,18 @@ def run(args):
             ):
                 raise RuntimeError("Android did not retry the exact receipt lookup after the missing-evidence backoff: " + repr(observations))
             print("PASS: Android retained pending acceptance evidence and retried the exact receipt GET after backoff; the isolated relay then returned the signed receipt",flush=True)
+        if args.cursor_expired:
+            if "pallasync_cursor_expired_recovery=passed" not in output:
+                raise RuntimeError("Android did not report a complete device-registry sync after cursor restart")
+            observations = relay.cursor_expired_observations
+            injected = [item for item in observations if item["outcome"] == "injected_409"]
+            if (
+                len(injected) != 1
+                or injected[0]["method"] != "GET"
+                or "cursor=" not in injected[0]["path"]
+            ):
+                raise RuntimeError("Android did not restart the durable device-registry page after CURSOR_EXPIRED: " + repr(observations))
+            print("PASS: isolated relay injected one §19.2 CURSOR_EXPIRED for a paginated device-registry GET; Android restarted from its first page and completed initial sync",flush=True)
         if args.records_413_process_death:
             if "pallasync_records_413_process_death=resumed_and_drained" not in output:
                 raise RuntimeError("The restarted Android process did not drain the pending outbox")
@@ -576,8 +613,7 @@ def run(args):
             raise RuntimeError("No public Android device identity was reported")
         subject = match.group(1)
         assert subject != client.device_id
-        status,registry,_ = http.request("GET",prefix+"/devices",admin=True)
-        assert status == 200,registry
+        registry = fetch_all_pages(http,prefix+"/devices",True,relay.page_limit)
         item = next(x for x in registry["items"] if x["device_record"]["device_id"] == subject)
         assert item["status"] == "active",item
         device = item["device_record"]
@@ -609,7 +645,7 @@ def run(args):
         paused_records = []
         replacement_records = []
         while True:
-            path = prefix+"/records?limit=200"+("&cursor="+cursor if cursor else "")
+            path = prefix+f"/records?limit={relay.page_limit}"+("&cursor="+cursor if cursor else "")
             status,page,_ = http.request("GET",path)
             assert status == 200,page
             for entry in page["items"]:
@@ -692,6 +728,7 @@ if __name__ == "__main__":
     parser.add_argument("--records-413-single",action="store_true",help="inject a single-record 413 and verify Android retains the exact outbox row and does not retry it")
     parser.add_argument("--receipt-not-found",action="store_true",help="return one normative receipt-not-found response and verify Android retries the exact lookup after backoff")
     parser.add_argument("--receipt-not-found-process-death",action="store_true",help="kill Android after receipt absence and verify its persisted backoff/evidence resumes in a fresh process")
+    parser.add_argument("--cursor-expired",action="store_true",help="inject one retryable CURSOR_EXPIRED during paginated device-registry sync and verify Android restarts from durable progress")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")
     parser.add_argument("--pruned-archive-probe",action="store_true",help="publish and prune an isolated normal chain, then verify and restore an archive requiring its trusted compaction boundary")
