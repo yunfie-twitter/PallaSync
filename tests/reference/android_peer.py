@@ -13,6 +13,31 @@ class AndroidPeerHandoff:
         self.adb, self.identifier = adb, identifier
         self.relay, self.creator, self.genesis, self.schema = relay, creator, genesis, schema
         self.log_id = log_id
+        listed = subprocess.run(
+            [adb, "devices"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+        )
+        if listed.returncode != 0:
+            raise RuntimeError("Could not enumerate ADB devices for the disposable peer handoff")
+        candidates = []
+        for line in listed.stdout.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 2 or fields[1] != "device" or not fields[0].startswith("emulator-"):
+                continue
+            name = subprocess.run(
+                [adb, "-s", fields[0], "emu", "avd", "name"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+            )
+            is_target = name.stdout.splitlines() and name.stdout.splitlines()[0].strip() == "PallaSyncV3Conformance"
+            if name.returncode == 0 and is_target:
+                candidates.append(fields[0])
+        if len(candidates) != 1:
+            raise RuntimeError("Exactly one running PallaSyncV3Conformance AVD is required for peer handoff")
+        self.device_serial = candidates[0]
         self.stop = threading.Event()
         self.failure, self.subject = None, None
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -24,7 +49,7 @@ class AndroidPeerHandoff:
         deadline = time.monotonic() + 240
         while time.monotonic() < deadline and not self.stop.is_set():
             try:
-                result = subprocess.run([self.adb,"-s","emulator-5580","shell","run-as","com.yunfie.illustia","cat",self.file(name)],capture_output=True,timeout=min(20,max(0.1,deadline-time.monotonic())))
+                result = subprocess.run([self.adb,"-s",self.device_serial,"shell","run-as","com.yunfie.illustia","cat",self.file(name)],capture_output=True,timeout=min(20,max(0.1,deadline-time.monotonic())))
             except subprocess.TimeoutExpired:
                 # Read-only polling can retry within its original overall deadline.
                 # A blocked ADB call is never evidence of a completed transfer.
@@ -41,7 +66,7 @@ class AndroidPeerHandoff:
         final = self.file(name)
         command = "cat > '" + final + ".pending' && mv '" + final + ".pending' '" + final + "'"
         shell = 'run-as com.yunfie.illustia sh -c "' + command + '"'
-        result = subprocess.run([self.adb,"-s","emulator-5580","shell",shell],input=data,capture_output=True,timeout=20)
+        result = subprocess.run([self.adb,"-s",self.device_serial,"shell",shell],input=data,capture_output=True,timeout=20)
         if result.returncode != 0:
             raise RuntimeError("Disposable public handoff write failed")
 
