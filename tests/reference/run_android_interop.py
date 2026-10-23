@@ -361,6 +361,8 @@ def run(args):
         if not re.search(r"OK \(1 test\)",output):
             if args.receipt_not_found:
                 print("RECEIPT NOT FOUND OBSERVATIONS",repr(relay.receipt_not_found_observations),flush=True)
+            if args.rotate_epoch and not args.replace_device:
+                print("EPOCH STALE OBSERVATIONS",repr(relay.epoch_stale_observations),flush=True)
             if args.delete_chain:
                 deletion_status,deletion_proof,_ = http.request("GET",prefix+"/deletion",admin=True)
                 safe_proof = {key: deletion_proof.get(key) for key in ("ledger","admin_operation","delete_receipt","deletion_transparency_entry")}
@@ -409,6 +411,19 @@ def run(args):
             if len(injected) != 1 or len(injected[0]["record_ids"]) != 1 or forwarded:
                 raise RuntimeError("Single-record 413 was retried or unexpectedly forwarded: " + repr(observations))
             print("PASS: one single-record 413 left its exact Android outbox row and durable blocker intact; no HTTP retry or relay acceptance occurred",flush=True)
+        if args.rotate_epoch and not args.replace_device:
+            if "pallasync_epoch_stale_response=passed" not in output:
+                raise RuntimeError("Android did not report processing the isolated per-item EPOCH_STALE response")
+            observations = relay.epoch_stale_observations
+            injected = [item for item in observations if item["outcome"] == "injected_per_item_409"]
+            forwarded = [item for item in observations if item["outcome"] == "forwarded"]
+            if len(injected) != 1 or len(injected[0]["record_ids"]) != 2:
+                raise RuntimeError("The isolated relay did not inject exactly one per-item rejection for both stale records: " + repr(observations))
+            stale_ids = set(injected[0]["record_ids"])
+            replacement_ids = {record_id for item in forwarded for record_id in item["record_ids"]}
+            if len(forwarded) < 1 or stale_ids.intersection(replacement_ids) or any(item["status"] != 200 for item in forwarded):
+                raise RuntimeError("Android retried an epoch-stale signed record or failed to upload rebuilt records: " + repr(observations))
+            print("PASS: isolated relay returned one §10.6 HTTP 200 batch with per-item 409 EPOCH_STALE; Android persisted the reconciliation state, rebuilt intents after verified epoch rotation, and never resent the stale record IDs",flush=True)
         if args.receipt_not_found:
             if "pallasync_receipt_not_found_recovery=passed" not in output:
                 raise RuntimeError("Android did not report receipt evidence recovery")

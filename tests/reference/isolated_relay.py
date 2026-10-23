@@ -43,6 +43,10 @@ class IsolatedRelay:
         self.receipt_not_found_armed = False
         self.receipt_not_found_tracking = False
         self.receipt_not_found_observations = []
+        self.epoch_stale_armed = False
+        self.epoch_stale_tracking = False
+        self.epoch_stale_parameters = {}
+        self.epoch_stale_observations = []
         self.on_keys_ack = None
         self.on_snapshot_part = None
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
@@ -89,6 +93,20 @@ class IsolatedRelay:
                     self.end_headers()
                     self.wfile.write(payload)
                     return
+                if self.command == "POST" and self.path == "/__test__/arm-epoch-stale":
+                    self.rfile.read(int(self.headers.get("Content-Length",0)))
+                    harness.epoch_stale_armed = True
+                    harness.epoch_stale_tracking = True
+                    harness.epoch_stale_observations.clear()
+                    chain = self.headers.get("X-Test-Chain-Id")
+                    metadata = harness.epoch_stale_parameters.get(chain)
+                    payload = jcs({"armed":True,"metadata":metadata})
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 # Integration clients revalidate public documents before every request.
                 # Pace this test transport within the unchanged disclosed rate ceilings.
                 if chain_delay and self.path.startswith("/pallasync/v3/chains"):
@@ -126,6 +144,37 @@ class IsolatedRelay:
                     record_batch = parsed.get("records") if isinstance(parsed,dict) else None
                     if not isinstance(record_batch,list):
                         raise ValueError("isolated records request did not contain a records array")
+                    if harness.epoch_stale_armed:
+                        harness.epoch_stale_armed = False
+                        chain = self.path.split("/",5)[4]
+                        metadata = harness.epoch_stale_parameters.get(chain)
+                        if not isinstance(metadata,dict):
+                            harness.epoch_stale_observations.append({"outcome":"missing_parameters","path":self.path})
+                            raise ValueError("cannot inject EPOCH_STALE without a previously observed parameters checkpoint")
+                        response_body = jcs({
+                            "accepted":[],
+                            "rejected":[
+                                {"record_id":record["record_id"],"status":409,"code":"EPOCH_STALE","retryable":True}
+                                for record in record_batch
+                            ],
+                            "upload_receipts":[],
+                            **metadata,
+                        })
+                        harness.epoch_stale_observations.append({
+                            "outcome":"injected_per_item_409",
+                            "path":self.path,
+                            "record_ids":[record["record_id"] for record in record_batch],
+                            "submitted_generations":[record.get("generation") for record in record_batch],
+                            "metadata":metadata,
+                            "response_body":strict_loads(response_body),
+                            "status":200,
+                        })
+                        self.send_response(200)
+                        self.send_header("Content-Type","application/vnd.palleria.sync.v3+json")
+                        self.send_header("Content-Length",str(len(response_body)))
+                        self.end_headers()
+                        self.wfile.write(response_body)
+                        return
                     if harness.records_413_armed:
                         harness.records_413_armed = False
                         harness.records_413_original_ids = {record["record_id"] for record in record_batch}
@@ -162,6 +211,23 @@ class IsolatedRelay:
                 connection.request(self.command,self.path,body,headers)
                 response = connection.getresponse()
                 payload = response.read(8_388_609)
+                if (response.status == 200 and self.command == "GET"
+                        and self.path.split("?",1)[0].endswith("/parameters")):
+                    value = strict_loads(payload)
+                    chain = self.path.split("/",5)[4]
+                    harness.epoch_stale_parameters[chain] = {
+                        "generation":value["generation"],
+                        "log_id":value["log_id"],
+                        "head_seq":value["head_seq"],
+                        "head_hash":value["head_hash"],
+                    }
+                if record_batch is not None and harness.epoch_stale_tracking:
+                    harness.epoch_stale_observations.append({
+                        "outcome":"forwarded",
+                        "path":self.path,
+                        "record_ids":[record["record_id"] for record in record_batch],
+                        "status":response.status,
+                    })
                 if is_receipt_lookup and harness.receipt_not_found_tracking:
                     harness.receipt_not_found_observations.append({
                         "outcome":"forwarded",
