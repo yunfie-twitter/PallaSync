@@ -220,6 +220,7 @@ def run(args):
                     "-e","records_413_process_death","true" if args.records_413_process_death else "false",
                     "-e","records_413_resume_after_death","true" if records_413_resume_after_death else "false",
                     "-e","records_413_single","true" if args.records_413_single else "false",
+                    "-e","receipt_not_found","true" if args.receipt_not_found else "false",
                     "-e","reseed_archive_probe","true" if args.reseed_archive_probe else "false",
                     "-e","pruned_archive_probe","true" if args.pruned_archive_probe else "false"]
                 if target_relay is not None:
@@ -297,6 +298,8 @@ def run(args):
                 adb("reverse","--remove",f"tcp:{target_relay.proxy.server_port}")
         print(output[-6000:],flush=True)
         if not re.search(r"OK \(1 test\)",output):
+            if args.receipt_not_found:
+                print("RECEIPT NOT FOUND OBSERVATIONS",repr(relay.receipt_not_found_observations),flush=True)
             if args.delete_chain:
                 deletion_status,deletion_proof,_ = http.request("GET",prefix+"/deletion",admin=True)
                 safe_proof = {key: deletion_proof.get(key) for key in ("ledger","admin_operation","delete_receipt","deletion_transparency_entry")}
@@ -345,6 +348,23 @@ def run(args):
             if len(injected) != 1 or len(injected[0]["record_ids"]) != 1 or forwarded:
                 raise RuntimeError("Single-record 413 was retried or unexpectedly forwarded: " + repr(observations))
             print("PASS: one single-record 413 left its exact Android outbox row and durable blocker intact; no HTTP retry or relay acceptance occurred",flush=True)
+        if args.receipt_not_found:
+            if "pallasync_receipt_not_found_recovery=passed" not in output:
+                raise RuntimeError("Android did not report receipt evidence recovery")
+            observations = relay.receipt_not_found_observations
+            if (
+                len(observations) != 2
+                or observations[0]["outcome"] != "injected_404"
+                or observations[1]["outcome"] != "forwarded"
+                or observations[1]["status"] != 200
+                or observations[0]["method"] != "GET"
+                or observations[1]["method"] != "GET"
+                or observations[0]["path"] != observations[1]["path"]
+                or "/receipts/" not in observations[0]["path"].split("?",1)[0]
+                or "log_id=" not in observations[0]["path"]
+            ):
+                raise RuntimeError("Android did not retry the exact receipt lookup after the missing-evidence backoff: " + repr(observations))
+            print("PASS: Android retained pending acceptance evidence and retried the exact receipt GET after backoff; the isolated relay then returned the signed receipt",flush=True)
         if args.records_413_process_death:
             if "pallasync_records_413_process_death=resumed_and_drained" not in output:
                 raise RuntimeError("The restarted Android process did not drain the pending outbox")
@@ -594,6 +614,7 @@ if __name__ == "__main__":
     parser.add_argument("--records-limit-preflight",action="store_true",help="set a signed 8192-byte relay request limit and verify Android submits unchanged outbox records in requests below that advertised limit")
     parser.add_argument("--records-413-process-death",action="store_true",help="kill Android with the first reduced batch in flight and verify restart resumes the persisted outbox limit")
     parser.add_argument("--records-413-single",action="store_true",help="inject a single-record 413 and verify Android retains the exact outbox row and does not retry it")
+    parser.add_argument("--receipt-not-found",action="store_true",help="return one normative receipt-not-found response and verify Android retries the exact lookup after backoff")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")
     parser.add_argument("--pruned-archive-probe",action="store_true",help="publish and prune an isolated normal chain, then verify and restore an archive requiring its trusted compaction boundary")

@@ -40,6 +40,9 @@ class IsolatedRelay:
         self.records_413_hold_replacement = False
         self.records_413_replacement_received = threading.Event()
         self.records_413_release_replacement = threading.Event()
+        self.receipt_not_found_armed = False
+        self.receipt_not_found_tracking = False
+        self.receipt_not_found_observations = []
         self.on_keys_ack = None
         self.on_snapshot_part = None
         self.relay_key = SigningKey(bytes(range(0xa0,0xc0)))  # Public C.9 test seed only.
@@ -74,6 +77,18 @@ class IsolatedRelay:
                     self.end_headers()
                     self.wfile.write(payload)
                     return
+                if self.command == "POST" and self.path == "/__test__/arm-receipt-not-found":
+                    self.rfile.read(int(self.headers.get("Content-Length",0)))
+                    harness.receipt_not_found_armed = True
+                    harness.receipt_not_found_tracking = True
+                    harness.receipt_not_found_observations.clear()
+                    payload = b'{"armed":true}'
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 # Integration clients revalidate public documents before every request.
                 # Pace this test transport within the unchanged disclosed rate ceilings.
                 if chain_delay and self.path.startswith("/pallasync/v3/chains"):
@@ -83,6 +98,28 @@ class IsolatedRelay:
                     self.send_error(413)
                     return
                 body = self.rfile.read(size)
+                is_receipt_lookup = (
+                    self.command == "GET"
+                    and self.path.split("?",1)[0].startswith("/pallasync/v3/chains/")
+                    and "/receipts/" in self.path.split("?",1)[0]
+                )
+                if is_receipt_lookup and harness.receipt_not_found_armed:
+                    harness.receipt_not_found_armed = False
+                    harness.receipt_not_found_observations.append({"outcome":"injected_404","method":self.command,"path":self.path})
+                    payload = jcs({
+                        "type":"about:blank",
+                        "title":"Receipt Not Found",
+                        "status":404,
+                        "code":"RECEIPT_NOT_FOUND",
+                        "retryable":True,
+                        "server_time_ms":int(time.time()*1000),
+                    })
+                    self.send_response(404)
+                    self.send_header("Content-Type","application/problem+json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
                 record_batch = None
                 if self.command == "POST" and self.path.endswith("/records"):
                     parsed = strict_loads(body)
@@ -125,6 +162,15 @@ class IsolatedRelay:
                 connection.request(self.command,self.path,body,headers)
                 response = connection.getresponse()
                 payload = response.read(8_388_609)
+                if is_receipt_lookup and harness.receipt_not_found_tracking:
+                    harness.receipt_not_found_observations.append({
+                        "outcome":"forwarded",
+                        "method":self.command,
+                        "path":self.path,
+                        "status":response.status,
+                    })
+                    if len(harness.receipt_not_found_observations) >= 2:
+                        harness.receipt_not_found_tracking = False
                 if response.status == 413:
                     harness.request_limit_observations.append({"path":self.path,"bytes":size,"code":strict_loads(payload).get("code") if payload else None})
                 if record_batch is not None and harness.records_413_tracking:
