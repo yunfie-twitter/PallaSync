@@ -9,6 +9,7 @@ import struct
 from contextlib import ExitStack
 import re
 import subprocess
+import threading
 import uuid
 from pathlib import Path
 from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_decrypt
@@ -200,8 +201,14 @@ def run(args):
                 relay_cert += (target_relay.directory/"tls.pem").read_bytes()
             if args.rebase_process_death and (not args.reseed or not args.rebase_fault):
                 raise ValueError("--rebase-process-death requires --reseed and --rebase-fault")
+            if args.receipt_not_found_process_death and not args.receipt_not_found:
+                raise ValueError("--receipt-not-found-process-death requires --receipt-not-found")
 
-            def instrumentation_command(resume_after_death=False, records_413_resume_after_death=False):
+            def instrumentation_command(
+                resume_after_death=False,
+                records_413_resume_after_death=False,
+                receipt_not_found_resume_after_death=False,
+            ):
                 command = ["shell","am","instrument","-w","-r","-e","class",
                     "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
                     "-e","relay_ca_base64",base64.b64encode(relay_cert).decode(),
@@ -221,6 +228,8 @@ def run(args):
                     "-e","records_413_resume_after_death","true" if records_413_resume_after_death else "false",
                     "-e","records_413_single","true" if args.records_413_single else "false",
                     "-e","receipt_not_found","true" if args.receipt_not_found else "false",
+                    "-e","receipt_not_found_process_death","true" if args.receipt_not_found_process_death else "false",
+                    "-e","receipt_not_found_resume_after_death","true" if receipt_not_found_resume_after_death else "false",
                     "-e","reseed_archive_probe","true" if args.reseed_archive_probe else "false",
                     "-e","pruned_archive_probe","true" if args.pruned_archive_probe else "false"]
                 if target_relay is not None:
@@ -232,9 +241,17 @@ def run(args):
                 command.append("com.yunfie.illustia.test/com.yunfie.illustia.pallasync.PallaSyncTestRunner")
                 return [args.adb,"-s",device_serial,*command]
 
-            def instrumentation(resume_after_death=False, records_413_resume_after_death=False):
+            def instrumentation(
+                resume_after_death=False,
+                records_413_resume_after_death=False,
+                receipt_not_found_resume_after_death=False,
+            ):
                 result = subprocess.run(
-                    instrumentation_command(resume_after_death, records_413_resume_after_death),capture_output=True,text=True,
+                    instrumentation_command(
+                        resume_after_death,
+                        records_413_resume_after_death,
+                        receipt_not_found_resume_after_death,
+                    ),capture_output=True,text=True,
                     encoding="utf-8",errors="replace",timeout=600,
                 )
                 return result.returncode, result.stdout + result.stderr
@@ -261,6 +278,50 @@ def run(args):
                     raise RuntimeError("Android process-death resume instrumentation failed: "+resume_output[-2000:])
                 output = first_output + "\nPROCESS-DEATH RESUME\n" + resume_output
                 print(f"PASS: first instrumentation process terminated at the committed boundary (exit {first_code}); a fresh process reopened Room/Keystore state",flush=True)
+            elif args.receipt_not_found_process_death:
+                process = subprocess.Popen(
+                    instrumentation_command(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                first_lines = []
+                reached_missing_receipt = threading.Event()
+
+                def collect_first_process_output():
+                    for line in process.stdout:
+                        first_lines.append(line)
+                        if "pallasync_receipt_not_found_process_death=waiting_after_404" in line:
+                            reached_missing_receipt.set()
+
+                output_reader = threading.Thread(target=collect_first_process_output, daemon=True)
+                output_reader.start()
+                if not reached_missing_receipt.wait(timeout=360):
+                    process.kill()
+                    process.wait(timeout=30)
+                    output_reader.join(timeout=30)
+                    raise RuntimeError(
+                        "Android did not reach the durable missing-receipt boundary: " + "".join(first_lines)[-4000:]
+                    )
+                adb("shell","am","force-stop","com.yunfie.illustia")
+                try:
+                    process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=30)
+                    raise RuntimeError("Android instrumentation process did not stop after force-stop")
+                output_reader.join(timeout=30)
+                first_output = "".join(first_lines)
+                if "OK (1 test)" in first_output:
+                    raise RuntimeError("Android completed before the missing-receipt process-death boundary")
+                resume_code, resume_output = instrumentation(receipt_not_found_resume_after_death=True)
+                if resume_code != 0 or "pallasync_receipt_not_found_process_death=resumed" not in resume_output:
+                    raise RuntimeError("Missing-receipt retry did not recover after process death: " + resume_output[-4000:])
+                output = first_output + "\nRECEIPT NOT FOUND PROCESS-DEATH RESUME\n" + resume_output
+                print("PASS: Android process died after receipt absence; a fresh process reopened the durable retry gate and recovered the exact accepted receipt",flush=True)
             elif args.records_413_process_death:
                 process = subprocess.Popen(
                     instrumentation_command(),
@@ -615,6 +676,7 @@ if __name__ == "__main__":
     parser.add_argument("--records-413-process-death",action="store_true",help="kill Android with the first reduced batch in flight and verify restart resumes the persisted outbox limit")
     parser.add_argument("--records-413-single",action="store_true",help="inject a single-record 413 and verify Android retains the exact outbox row and does not retry it")
     parser.add_argument("--receipt-not-found",action="store_true",help="return one normative receipt-not-found response and verify Android retries the exact lookup after backoff")
+    parser.add_argument("--receipt-not-found-process-death",action="store_true",help="kill Android after receipt absence and verify its persisted backoff/evidence resumes in a fresh process")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")
     parser.add_argument("--pruned-archive-probe",action="store_true",help="publish and prune an isolated normal chain, then verify and restore an archive requiring its trusted compaction boundary")
