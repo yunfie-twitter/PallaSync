@@ -45,6 +45,12 @@ class IsolatedRelay:
         self.receipt_not_found_armed = False
         self.receipt_not_found_tracking = False
         self.receipt_not_found_observations = []
+        self.pending_evidence_withhold_armed = False
+        self.pending_evidence_success_pages = 0
+        self.pending_evidence_missing_page = False
+        self.pending_evidence_withhold_tracking = False
+        self.pending_evidence_withhold_observations = []
+        self.transparency_entries_observations = []
         self.epoch_stale_armed = False
         self.epoch_stale_tracking = False
         self.epoch_stale_parameters = {}
@@ -68,6 +74,7 @@ class IsolatedRelay:
                 pass
 
             def forward(self):
+                inject_transparency_gap = False
                 if self.command == "POST" and self.path in {
                     "/__test__/arm-records-413",
                     "/__test__/arm-records-413-process-death",
@@ -94,6 +101,37 @@ class IsolatedRelay:
                     harness.receipt_not_found_tracking = True
                     harness.receipt_not_found_observations.clear()
                     payload = b'{"armed":true}'
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                if self.command == "POST" and self.path == "/__test__/arm-pending-evidence-withhold":
+                    raw = self.rfile.read(int(self.headers.get("Content-Length",0)))
+                    options = strict_loads(raw) if raw else {}
+                    successful_pages = options.get("successful_pages",0)
+                    missing_page = options.get("missing_page",False)
+                    if not isinstance(successful_pages,int) or isinstance(successful_pages,bool) or not 0 <= successful_pages <= 1000:
+                        raise ValueError("invalid pending-evidence test page delay")
+                    if not isinstance(missing_page,bool):
+                        raise ValueError("invalid pending-evidence missing-page option")
+                    harness.pending_evidence_withhold_armed = True
+                    harness.pending_evidence_success_pages = successful_pages
+                    harness.pending_evidence_missing_page = missing_page
+                    harness.pending_evidence_withhold_tracking = True
+                    harness.pending_evidence_withhold_observations.clear()
+                    payload = b'{"armed":true}'
+                    self.send_response(200)
+                    self.send_header("Content-Type","application/json")
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                if self.command == "POST" and self.path == "/__test__/clear-transparency-observations":
+                    self.rfile.read(int(self.headers.get("Content-Length",0)))
+                    harness.transparency_entries_observations.clear()
+                    payload = b'{"cleared":true}'
                     self.send_response(200)
                     self.send_header("Content-Type","application/json")
                     self.send_header("Content-Length",str(len(payload)))
@@ -168,8 +206,45 @@ class IsolatedRelay:
                     self.end_headers()
                     self.wfile.write(payload)
                     return
+                is_transparency_entries = (
+                    self.command == "GET"
+                    and urlsplit(self.path).path.startswith("/pallasync/v3/chains/")
+                    and urlsplit(self.path).path.endswith("/transparency/entries")
+                )
+                if is_transparency_entries and harness.pending_evidence_withhold_armed:
+                    if harness.pending_evidence_success_pages > 0:
+                        harness.pending_evidence_success_pages -= 1
+                    elif harness.pending_evidence_missing_page:
+                        harness.pending_evidence_withhold_armed = False
+                        harness.pending_evidence_missing_page = False
+                        inject_transparency_gap = True
+                    else:
+                        harness.pending_evidence_withhold_armed = False
+                        harness.pending_evidence_withhold_observations.append({
+                            "outcome":"injected_503",
+                            "method":self.command,
+                            "path":self.path,
+                        })
+                        payload = jcs({
+                            "type":"about:blank",
+                            "title":"Relay Unavailable",
+                            "status":503,
+                            "code":"RELAY_UNAVAILABLE",
+                            "retryable":True,
+                        })
+                        self.send_response(503)
+                        self.send_header("Content-Type","application/problem+json")
+                        self.send_header("Retry-After","1")
+                        self.send_header("Content-Length",str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
                 record_batch = None
-                if self.command == "POST" and self.path.endswith("/records"):
+                if (
+                    self.command == "POST"
+                    and urlsplit(self.path).path.startswith("/pallasync/v3/chains/")
+                    and urlsplit(self.path).path.endswith("/records")
+                ):
                     parsed = strict_loads(body)
                     record_batch = parsed.get("records") if isinstance(parsed,dict) else None
                     if not isinstance(record_batch,list):
@@ -241,6 +316,25 @@ class IsolatedRelay:
                 connection.request(self.command,self.path,body,headers)
                 response = connection.getresponse()
                 payload = response.read(8_388_609)
+                if inject_transparency_gap and response.status == 200:
+                    missing_page = strict_loads(payload)
+                    if not isinstance(missing_page,dict) or not isinstance(missing_page.get("items"),list) or not missing_page["items"]:
+                        raise ValueError("the expected non-empty transparency page was unavailable to corrupt")
+                    missing_page["items"] = []
+                    payload = jcs(missing_page)
+                if is_transparency_entries:
+                    self_path = urlsplit(self.path)
+                    query = parse_qs(self_path.query)
+                    next_cursor = None
+                    if response.status == 200:
+                        page = strict_loads(payload)
+                        next_cursor = page.get("next_cursor")
+                    harness.transparency_entries_observations.append({
+                        "path": self.path,
+                        "query": query,
+                        "next_cursor": next_cursor,
+                        "status": response.status,
+                    })
                 if (response.status == 200 and self.command == "GET"
                         and self.path.split("?",1)[0].endswith("/parameters")):
                     value = strict_loads(payload)
@@ -267,6 +361,15 @@ class IsolatedRelay:
                     })
                     if len(harness.receipt_not_found_observations) >= 2:
                         harness.receipt_not_found_tracking = False
+                if is_transparency_entries and harness.pending_evidence_withhold_tracking:
+                    harness.pending_evidence_withhold_observations.append({
+                        "outcome":"injected_missing_page" if inject_transparency_gap else "forwarded",
+                        "method":self.command,
+                        "path":self.path,
+                        "status":response.status,
+                    })
+                    if response.status == 200 and not harness.pending_evidence_withhold_armed and not inject_transparency_gap:
+                        harness.pending_evidence_withhold_tracking = False
                 if (harness.cursor_expired_tracking and self.command == "GET"
                         and urlsplit(self.path).path == harness.cursor_expired_route
                         and not parse_qs(urlsplit(self.path).query).get("cursor")):

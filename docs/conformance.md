@@ -55,3 +55,5 @@ acknowledged suffix lossからの復旧は、削除台帳・nonce状態・source
 2026-10-13の再検証ではserverの全26試験、fmt／clippy／bins build、独立Python／隔離HTTPS relayのepoch・CAS・atomic失効、peer承認、凍結legacy／nonce／旧版削除、Docker設定生成が通過しました（target/qualification-*.log）。Androidの全機能、全50 IT、production更新は完了していません。
 
 同日、再生成client APKと隔離relayで `run_android_interop.py --rotate-epoch --peer-enrollment` を再実行し190.27秒で成功しました（`target/qualification-android-resume-interop.log`）。Android由来の暗号化record・同期・epoch・peer承認証拠を、Python参照clientが独立に検証します。この対象試験はAppendix Bの完全な認証、Android recovery lifecycle全件、IT-01〜IT-50を意味しません。
+
+2026-10-24: 隔離HTTPSテストproxyに、透明性ページの一時503・途中entry欠落と、範囲／cursorの観測を追加しました。Android harnessは通常probeのcheckpoint取消・同一targetへの再開、およびRoom保存後／保護checkpoint前のprocess-deathを検査し、途中markerに加えてAndroidJUnitRunnerの最終成功を必須とします。§§10.17、11.2、11.5、17.8–17.9に基づき、通常probeではanchor 10→11で取消後、残り2ページで13へ到達、過去証拠では10ページの再開と保留recordの適用を確認しました。API 37 x86_64の隔離AVDで両harnessがexit 0、独立Python復旧moduleは10件成功（2.407秒）、変更harnessのpy_compileも成功しました。§5.6／Appendix C.8のGF検査は独立galois実装の小規模profileと固定vectorを対象とします。生の試験結果と限界はPalleriaのdocs/pallasync-v3-evidenceおよびdocs/pallasync-v3-validation.mdへ記録しています。これは全IT・物理端末・本番適合の証明ではありません。relay本体や公開APIに試験用route・復号機能は追加していません。

@@ -10,11 +10,13 @@ from contextlib import ExitStack
 import re
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_decrypt
-from protocol import b64, decode, epoch_keys, jcs, object_hash, strict_loads, verify
-from attestations import Pin, ledger_hash
+from protocol import b64, decode, epoch_keys, jcs, object_hash, signed, strict_loads, verify
+from attestations import Pin, ledger_hash, receipt as verify_upload_receipt, transparency_link
 from crypto_client import CryptoClient
 from http_client import ReferenceHTTP
 from isolated_relay import IsolatedRelay, ROOT
@@ -108,6 +110,70 @@ def fetch_all_pages(remote, path, admin, limit):
             return {**last, "items": items, "next_cursor": None}
 
 
+def delete_chain_with_admin(remote, client, prefix):
+    """Commit the interop fixture's spec-authorized deletion during archive restore."""
+    status, parameters_response, _ = remote.request("GET", prefix + "/parameters", admin=True)
+    if status != 200:
+        raise RuntimeError(f"Could not read deletion parameters: {status} {parameters_response}")
+    parameters = parameters_response["parameters"]
+    status, epochs_response, _ = remote.request("GET", prefix + "/epochs?limit=200", admin=True)
+    if status != 200 or not epochs_response.get("items"):
+        raise RuntimeError(f"Could not read deletion epoch head: {status} {epochs_response}")
+    latest_epoch = max(epochs_response["items"], key=lambda item: item["epoch"]["epoch"])
+    deletion_id = str(uuid.uuid4())
+    target = {
+        "deletion_id": deletion_id,
+        "expected_parameters_hash": parameters_response["parameters_hash"],
+        "expected_epoch_hash": latest_epoch["epoch_hash"],
+    }
+    admin_operation = signed(
+        {
+            "operation_id": str(uuid.uuid4()),
+            "chain_id": client.chain,
+            "generation": parameters["generation"],
+            "action": "delete_chain",
+            "expected_parameters_hash": target["expected_parameters_hash"],
+            "expected_epoch_hash": target["expected_epoch_hash"],
+            "target_hash": object_hash(target),
+            "created_at_ms": int(time.time() * 1000),
+        },
+        client.admin,
+        b"PALLASYNC-ADMIN-OP-v3\0",
+    )
+    status, result, _ = remote.request("DELETE", prefix, {**target, "admin_operation": admin_operation}, admin=True)
+    if status != 202 or result.get("deletion_id") != deletion_id:
+        raise RuntimeError(f"Admin-authorized deletion race was not committed: {status} {result}")
+    return deletion_id
+
+
+def verify_retained_transparency_suffix(remote, prefix, pin, anchor_index, anchor_hash, target):
+    """Independently verify every signed entry between Android's retained anchor and the new head."""
+    pin.signed(target, b"PALLASYNC-TRANSPARENCY-HEAD-v3\0")
+    index, previous, cursor = anchor_index, anchor_hash, None
+    entries = {}
+    while index < target["entry_index"]:
+        path = (prefix + "/transparency/entries?transparency_id=" + target["transparency_id"]
+                + f"&after_index={anchor_index}&through_index={target['entry_index']}&limit=1"
+                + ("&cursor=" + cursor if cursor else ""))
+        status, page, _ = remote.request("GET", path, admin=True)
+        if (status != 200 or page.get("head") != target
+                or page.get("anchor_index") != index or page.get("anchor_hash") != previous
+                or len(page.get("items", [])) != 1):
+            raise RuntimeError(f"Independent transparency suffix page/anchor mismatch: {status} {page}")
+        entry = page["items"][0]
+        if entry["entry_index"] != index + 1 or entry["transparency_id"] != target["transparency_id"]:
+            raise RuntimeError("Independent transparency suffix skipped an index or changed incarnation")
+        previous = transparency_link(previous, entry, pin)
+        index += 1
+        entries[entry["object_hash"]] = entry
+        cursor = page.get("next_cursor")
+        if page.get("has_more") != (cursor is not None) or (cursor is not None) != (index < target["entry_index"]):
+            raise RuntimeError("Independent transparency suffix ended early or advertised a spurious continuation")
+    if previous != target["transparency_hash"]:
+        raise RuntimeError("Independent transparency suffix did not reach the signed target hash")
+    return entries
+
+
 def run(args):
     listed = subprocess.run([args.adb,"devices"],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=30)
     if listed.returncode != 0:
@@ -135,10 +201,14 @@ def run(args):
 
     if adb("emu","avd","name").splitlines()[0].strip() != "PallaSyncV3Conformance":
         raise RuntimeError("Only the disposable PallaSyncV3Conformance AVD is authorized")
+    if adb("shell","am","get-started-user-state","0").strip() != "RUNNING_UNLOCKED":
+        raise RuntimeError("The disposable AVD user must be unlocked before accessing credential-encrypted Room/Keystore fixtures")
     for apk in (args.app_apk,args.test_apk):
         if "Success" not in adb("install","-r","-t",str(Path(apk).resolve())):
             raise RuntimeError("APK installation did not succeed")
     client = CryptoClient(" ".join(["abandon"]*23+["art"]))
+    if args.transparency_anchor_cancel_resume and not args.transparency_anchor_resume:
+        raise ValueError("--transparency-anchor-cancel-resume requires --transparency-anchor-resume")
     schema = strict_loads((ROOT/"docs/privacy.schema.json").read_bytes())
     if args.delete_response_lost and not args.delete_chain:
         raise ValueError("--delete-response-lost requires --delete-chain")
@@ -148,7 +218,7 @@ def run(args):
             chain_delay=1.5,
             drop_delete_response=args.delete_response_lost,
             max_request_bytes=8_192 if args.records_limit_preflight else 8_388_608,
-            page_limit=1 if args.cursor_expired else 1000,
+            page_limit=1 if args.cursor_expired or args.pending_evidence_withhold or args.transparency_page_gap or args.transparency_recovery_process_death or args.transparency_recovery_cancel_resume or args.transparency_anchor_resume else 1000,
         ))
         target_relay = stack.enter_context(IsolatedRelay(args.relay_binary)) if args.reseed else None
         if (args.reseed_split_view or args.reseed_pre_capture_write or args.reseed_staging_write) and target_relay is None:
@@ -157,6 +227,28 @@ def run(args):
             raise ValueError("--reseed-archive-probe requires --reseed")
         if args.pruned_archive_probe and args.reseed:
             raise ValueError("--pruned-archive-probe runs on a normal chain, without --reseed")
+        if args.archive_restore_process_death and not args.pruned_archive_probe:
+            raise ValueError("--archive-restore-process-death requires --pruned-archive-probe")
+        if args.archive_deletion_race and not args.pruned_archive_probe:
+            raise ValueError("--archive-deletion-race requires --pruned-archive-probe")
+        if args.archive_restore_process_death and args.archive_deletion_race:
+            raise ValueError("archive process death and deletion race are separate scenarios")
+        if args.transparency_recovery_process_death and (
+            args.reseed or args.replace_device or args.rotate_epoch or args.delete_chain or args.peer_enrollment
+        ):
+            raise ValueError("--transparency-recovery-process-death is a standalone normal-chain scenario")
+        if args.transparency_recovery_cancel_resume and (
+            args.reseed or args.replace_device or args.rotate_epoch or args.delete_chain or args.peer_enrollment
+        ):
+            raise ValueError("--transparency-recovery-cancel-resume is a standalone normal-chain scenario")
+        if args.transparency_anchor_resume and (
+            args.reseed or args.replace_device or args.rotate_epoch or args.delete_chain or args.peer_enrollment
+            or args.pending_evidence_withhold or args.transparency_page_gap
+            or args.transparency_recovery_process_death or args.transparency_recovery_cancel_resume
+        ):
+            raise ValueError("--transparency-anchor-resume is a standalone retained-anchor scenario")
+        if args.pending_evidence_withhold and (args.replace_device or args.rotate_epoch or args.delete_chain or args.peer_enrollment):
+            raise ValueError("--pending-evidence-withhold is a standalone normal-chain scenario")
         race_scenarios = sum((args.reseed_split_view, args.reseed_pre_capture_write, args.reseed_staging_write))
         if race_scenarios > 1:
             raise ValueError("split-view, staging-write and pre-capture-write are separate scenarios")
@@ -230,9 +322,19 @@ def run(args):
                 resume_after_death=False,
                 records_413_resume_after_death=False,
                 receipt_not_found_resume_after_death=False,
+                archive_restore_resume_after_death=False,
+                transparency_recovery_resume_after_death=False,
+                archive_deletion_race=False,
+                transparency_anchor_resume_after_append=False,
+                transparency_anchor_before=None,
             ):
+                test_class = (
+                    "com.yunfie.illustia.pallasync.PallaSyncTransparencyAnchorInteropTest"
+                    if args.transparency_anchor_resume
+                    else "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest"
+                )
                 command = ["shell","am","instrument","-w","-r","-e","class",
-                    "com.yunfie.illustia.pallasync.PallaSyncRelayInteropTest","-e","relay_origin",relay.origin,
+                    test_class,"-e","relay_origin",relay.origin,
                     "-e","relay_ca_base64",base64.b64encode(relay_cert).decode(),
                     "-e","rotate_epoch","true" if args.rotate_epoch else "false",
                     "-e","cursor_expired","true" if args.cursor_expired else "false",
@@ -254,7 +356,19 @@ def run(args):
                     "-e","receipt_not_found_process_death","true" if args.receipt_not_found_process_death else "false",
                     "-e","receipt_not_found_resume_after_death","true" if receipt_not_found_resume_after_death else "false",
                     "-e","reseed_archive_probe","true" if args.reseed_archive_probe else "false",
-                    "-e","pruned_archive_probe","true" if args.pruned_archive_probe else "false"]
+                    "-e","pruned_archive_probe","true" if args.pruned_archive_probe else "false",
+                    "-e","archive_restore_process_death","true" if args.archive_restore_process_death else "false",
+                    "-e","archive_restore_resume_after_death","true" if archive_restore_resume_after_death else "false",
+                    "-e","archive_deletion_race","true" if archive_deletion_race else "false",
+                    "-e","pending_evidence_withhold","true" if args.pending_evidence_withhold else "false",
+                    "-e","transparency_recovery_process_death","true" if args.transparency_recovery_process_death else "false",
+                    "-e","transparency_recovery_cancel_resume","true" if args.transparency_recovery_cancel_resume else "false",
+                    "-e","transparency_page_gap","true" if args.transparency_page_gap else "false",
+                    "-e","transparency_anchor_resume","true" if args.transparency_anchor_resume else "false",
+                    "-e","transparency_anchor_cancel_resume","true" if args.transparency_anchor_cancel_resume else "false",
+                    "-e","transparency_anchor_resume_after_append","true" if transparency_anchor_resume_after_append else "false",
+                    "-e","transparency_anchor_before",str(0 if transparency_anchor_before is None else transparency_anchor_before),
+                    "-e","transparency_recovery_resume_after_death","true" if transparency_recovery_resume_after_death else "false"]
                 if target_relay is not None:
                     command.extend(["-e","reseed_target_origin",target_relay.origin])
                 if args.rebase_fault and not resume_after_death:
@@ -268,12 +382,22 @@ def run(args):
                 resume_after_death=False,
                 records_413_resume_after_death=False,
                 receipt_not_found_resume_after_death=False,
+                archive_restore_resume_after_death=False,
+                transparency_recovery_resume_after_death=False,
+                archive_deletion_race=False,
+                transparency_anchor_resume_after_append=False,
+                transparency_anchor_before=None,
             ):
                 result = subprocess.run(
                     instrumentation_command(
                         resume_after_death,
                         records_413_resume_after_death,
                         receipt_not_found_resume_after_death,
+                        archive_restore_resume_after_death,
+                        transparency_recovery_resume_after_death,
+                        archive_deletion_race,
+                        transparency_anchor_resume_after_append,
+                        transparency_anchor_before,
                     ),capture_output=True,text=True,
                     encoding="utf-8",errors="replace",timeout=600,
                 )
@@ -301,6 +425,178 @@ def run(args):
                     raise RuntimeError("Android process-death resume instrumentation failed: "+resume_output[-2000:])
                 output = first_output + "\nPROCESS-DEATH RESUME\n" + resume_output
                 print(f"PASS: first instrumentation process terminated at the committed boundary (exit {first_code}); a fresh process reopened Room/Keystore state",flush=True)
+            elif args.archive_restore_process_death:
+                process = subprocess.Popen(
+                    instrumentation_command(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                first_lines = []
+                installed_snapshot = threading.Event()
+
+                def collect_archive_restore_output():
+                    for line in process.stdout:
+                        first_lines.append(line)
+                        if "pallasync_archive_restore_process_death=snapshot_installed" in line:
+                            installed_snapshot.set()
+
+                output_reader = threading.Thread(target=collect_archive_restore_output, daemon=True)
+                output_reader.start()
+                if not installed_snapshot.wait(timeout=600):
+                    process.kill()
+                    process.wait(timeout=30)
+                    output_reader.join(timeout=30)
+                    raise RuntimeError(
+                        "Android did not reach the durable archive snapshot-install boundary: "
+                        + "".join(first_lines)[-5000:]
+                    )
+                try:
+                    first_code = process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    adb("shell","am","force-stop","com.yunfie.illustia")
+                    try:
+                        first_code = process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=30)
+                        output_reader.join(timeout=30)
+                        raise RuntimeError("Android instrumentation did not stop after the archive restore process death")
+                output_reader.join(timeout=30)
+                first_output = "".join(first_lines)
+                if "OK (1 test)" in first_output or "snapshot_installed" not in first_output:
+                    raise RuntimeError(
+                        "Android completed instead of stopping after durable archive installation "
+                        f"(exit {first_code}): {first_output[-5000:]}"
+                    )
+                adb("shell","am","force-stop","com.yunfie.illustia")
+                resume_code,resume_output = instrumentation(archive_restore_resume_after_death=True)
+                if resume_code != 0 or "pallasync_archive_restore_process_death=resumed_and_materialized" not in resume_output:
+                    raise RuntimeError("Pruned archive restore did not resume after process death: " + resume_output[-5000:])
+                output = first_output + "\nARCHIVE RESTORE PROCESS-DEATH RESUME\n" + resume_output
+                print("PASS: Android process died after the archive snapshot transaction committed; a fresh process reverified the archive, resumed suffix materialization and restored the chain",flush=True)
+            elif args.archive_deletion_race:
+                process = subprocess.Popen(
+                    instrumentation_command(archive_deletion_race=True),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                race_lines = []
+                archive_verified = threading.Event()
+
+                def collect_archive_deletion_race_output():
+                    for line in process.stdout:
+                        race_lines.append(line)
+                        if "pallasync_archive_deletion_race=waiting_for_external_delete" in line:
+                            archive_verified.set()
+
+                output_reader = threading.Thread(target=collect_archive_deletion_race_output, daemon=True)
+                output_reader.start()
+                if not archive_verified.wait(timeout=540):
+                    process.kill()
+                    process.wait(timeout=30)
+                    output_reader.join(timeout=30)
+                    raise RuntimeError("Android did not reach the post-verification/pre-install race boundary: " + "".join(race_lines)[-5000:])
+                deletion_id = delete_chain_with_admin(http, client, prefix)
+                try:
+                    process_code = process.wait(timeout=45)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=30)
+                    output_reader.join(timeout=30)
+                    raise RuntimeError("Android did not finish after the isolated relay committed deletion: " + "".join(race_lines)[-5000:])
+                output_reader.join(timeout=30)
+                output = "".join(race_lines)
+                if process_code != 0 or "pallasync_archive_deletion_race=blocked_for_transparency_dependency_with_state_retained" not in output:
+                    raise RuntimeError("Archive restore did not refuse the racing signed deletion: " + output[-5000:])
+                proof_status, proof, _ = http.request("GET", prefix + "/deletion", admin=True)
+                if proof_status != 200 or proof["ledger"]["deletion_id"] != deletion_id:
+                    raise RuntimeError(f"Independent deletion proof lookup failed: {proof_status} {proof}")
+                pin = Pin(client.chain, created["log_id"], bytes(relay.relay_key.verify_key))
+                pin.signed(proof["delete_receipt"], b"PALLASYNC-DELETE-RECEIPT-v3\0")
+                pin.signed(proof["deletion_transparency_entry"], b"PALLASYNC-TRANSPARENCY-ENTRY-v3\0")
+                if ledger_hash(proof["ledger"]) != proof["delete_receipt"]["ledger_receipt_hash"]:
+                    raise RuntimeError("Independent deletion ledger/receipt hash check failed")
+                print("PASS: after archive verification, Python committed a signed admin deletion; Android's final GET /deletion blocked snapshot install and retained Room state/keys because the post-delete transparency predecessor was unavailable; Python independently verified the deletion receipt and transparency entry", flush=True)
+            elif args.transparency_recovery_process_death:
+                process = subprocess.Popen(
+                    instrumentation_command(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                first_lines = []
+                page_persisted = threading.Event()
+
+                def collect_transparency_recovery_output():
+                    for line in process.stdout:
+                        first_lines.append(line)
+                        if "pallasync_transparency_recovery_process_death=page_persisted" in line:
+                            page_persisted.set()
+
+                output_reader = threading.Thread(target=collect_transparency_recovery_output, daemon=True)
+                output_reader.start()
+                if not page_persisted.wait(timeout=360):
+                    process.kill()
+                    process.wait(timeout=30)
+                    output_reader.join(timeout=30)
+                    raise RuntimeError(
+                        "Android did not reach the committed transparency page before checkpoint boundary: "
+                        + "".join(first_lines)[-5000:]
+                    )
+                adb("shell","am","force-stop","com.yunfie.illustia")
+                try:
+                    first_code = process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=30)
+                    raise RuntimeError("Android instrumentation did not stop after the transparency recovery process death")
+                output_reader.join(timeout=30)
+                first_output = "".join(first_lines)
+                if "OK (1 test)" in first_output:
+                    raise RuntimeError("Android completed before the transparency recovery process-death boundary")
+                relay.transparency_entries_observations.clear()
+                resume_code, resume_output = instrumentation(transparency_recovery_resume_after_death=True)
+                if (resume_code != 0 or "OK (1 test)" not in resume_output
+                        or "pallasync_transparency_recovery_process_death=resumed_and_applied" not in resume_output):
+                    raise RuntimeError("Historical transparency recovery did not resume after process death: " + resume_output[-5000:])
+                recovered_pages = [
+                    item for item in relay.transparency_entries_observations
+                    if item["status"] == 200
+                    and item["query"].get("through_index")
+                    and item["query"].get("after_index")
+                ]
+                cursors = [item["query"].get("cursor", [None])[0] for item in recovered_pages]
+                same_range = len({
+                    (item["query"]["after_index"][0], item["query"]["through_index"][0])
+                    for item in recovered_pages
+                }) == 1
+                cursor_chain = len(recovered_pages) >= 2 and all(
+                    cursors[index + 1] == recovered_pages[index]["next_cursor"]
+                    for index in range(len(recovered_pages) - 1)
+                )
+                if not same_range or not cursor_chain or recovered_pages[-1]["next_cursor"] is not None:
+                    raise RuntimeError(
+                        "Transparency recovery did not resume across a complete multi-page cursor chain: "
+                        + repr(relay.transparency_entries_observations)
+                    )
+                output = first_output + "\nTRANSPARENCY RECOVERY PROCESS-DEATH RESUME\n" + resume_output
+                print(output[-6000:],flush=True)
+                print(
+                    f"PASS: Android died after a verified transparency page committed to Room but before the protected resume anchor; a fresh process replayed and applied the pending immutable record across {len(recovered_pages)} one-entry pages",
+                    flush=True,
+                )
+                return
             elif args.receipt_not_found_process_death:
                 process = subprocess.Popen(
                     instrumentation_command(),
@@ -374,6 +670,88 @@ def run(args):
                     raise RuntimeError("Reduced-batch retry did not resume after process death: " + resume_output[-4000:])
                 output = first_output + "\n413 PROCESS-DEATH RESUME\n" + resume_output
                 print("PASS: process died with a reduced batch pending; a fresh process reopened the same outbox and completed recovery",flush=True)
+            elif args.transparency_recovery_cancel_resume:
+                relay.transparency_entries_observations.clear()
+                _, output = instrumentation()
+                if (
+                    "pallasync_transparency_recovery_cancel_resume=cancelled_at_page_checkpoint" not in output
+                    or "pallasync_transparency_recovery_cancel_resume=resumed_and_applied" not in output
+                ):
+                    raise RuntimeError("Android did not retain and resume the pending record after page-boundary cancellation: " + output[-5000:])
+                resumed_pages = [
+                    item for item in relay.transparency_entries_observations
+                    if item["status"] == 200 and item["query"].get("after_index") == ["1"]
+                ]
+                cursors = [item["query"].get("cursor", [None])[0] for item in resumed_pages]
+                same_range = len({item["query"].get("through_index", [None])[0] for item in resumed_pages}) == 1
+                cursor_chain = len(resumed_pages) >= 2 and all(
+                    cursors[index + 1] == resumed_pages[index]["next_cursor"]
+                    for index in range(len(resumed_pages) - 1)
+                )
+                if not same_range or not cursor_chain or resumed_pages[-1]["next_cursor"] is not None:
+                    raise RuntimeError("Cancellation did not resume from the durable anchor across the remaining pages: " + repr(resumed_pages))
+                print(
+                    f"PASS: cancelling after the durable first transparency page kept the signed record pending; retry resumed from anchor 1 and completed {len(resumed_pages)} remaining one-entry pages",
+                    flush=True,
+                )
+            elif args.transparency_anchor_resume:
+                baseline_code, baseline_output = instrumentation()
+                match = re.search(r"pallasync_transparency_anchor_resume_baseline=(\d+)", baseline_output)
+                anchor_hash_match = re.search(r"pallasync_transparency_anchor_resume_baseline_hash=([A-Za-z0-9_-]{43})", baseline_output)
+                if baseline_code != 0 or "OK (1 test)" not in baseline_output or match is None or anchor_hash_match is None:
+                    raise RuntimeError("Android did not retain a non-zero verified transparency anchor: " + baseline_output[-4000:])
+                anchor = int(match.group(1))
+                anchor_hash = anchor_hash_match.group(1)
+                pin = Pin(client.chain, created["log_id"], bytes(relay.relay_key.verify_key))
+                status, baseline_head, _ = http.request("GET", prefix+"/transparency/head", admin=True)
+                if status != 200:
+                    raise RuntimeError("Independent reference could not read the retained transparency head")
+                baseline_head = baseline_head["head"]
+                pin.signed(baseline_head, b"PALLASYNC-TRANSPARENCY-HEAD-v3\0")
+                if baseline_head["entry_index"] != anchor or baseline_head["transparency_hash"] != anchor_hash:
+                    raise RuntimeError("Android's retained anchor did not match the original signed baseline head")
+                suffix_records = [
+                    client.record(
+                        "palleria.search_history/3",
+                        [{"entity_id":f"Python post-anchor suffix {number}","operation":"upsert","lamport":1_000_003+number,
+                          "created_at_ms":3+number,"context":{},"body":{"query":f"Python post-anchor suffix {number}"}}],
+                    ) for number in range(3)
+                ]
+                status, accepted, _ = http.request("POST", prefix+"/records", {"records":suffix_records})
+                if status != 200 or len(accepted.get("accepted",[])) != len(suffix_records):
+                    raise RuntimeError(f"Independent signed transparency suffix was not accepted: {status} {accepted}")
+                status, target_head, _ = http.request("GET", prefix+"/transparency/head", admin=True)
+                if status != 200:
+                    raise RuntimeError("Independent reference could not read the appended signed transparency head")
+                target_head = target_head["head"]
+                if target_head["entry_index"] != anchor + len(suffix_records):
+                    raise RuntimeError("The isolated suffix contains unexpected extra or missing entries")
+                suffix_entries = verify_retained_transparency_suffix(http, prefix, pin, anchor, anchor_hash, target_head)
+                upload_receipts = {item["object_hash"]: item for item in accepted["upload_receipts"]}
+                for record in suffix_records:
+                    digest = object_hash(record)
+                    upload_receipt = upload_receipts[digest]
+                    status, proof, _ = http.request(
+                        "GET", prefix+f"/receipts/{upload_receipt['relay_seq']}?log_id={pin.log}", admin=True,
+                    )
+                    if status != 200 or proof["receipt"] != upload_receipt:
+                        raise RuntimeError("The retained suffix receipt changed after its atomic acceptance")
+                    verify_upload_receipt(upload_receipt, record, proof["entry"], pin, suffix_entries[digest])
+                print("PASS: independent Python verified all three suffix signatures/hash links and their immutable upload receipts",flush=True)
+                resume_code, resume_output = instrumentation(
+                    transparency_anchor_resume_after_append=True,
+                    transparency_anchor_before=anchor,
+                )
+                if (resume_code != 0 or "OK (1 test)" not in resume_output
+                        or "pallasync_transparency_anchor_resume=" not in resume_output):
+                    raise RuntimeError(
+                        "Android did not verify the independently appended suffix after its retained anchor: "
+                        + resume_output[-5000:]
+                        + "\ntransparency_requests="
+                        + repr(relay.transparency_entries_observations)
+                    )
+                output = baseline_output + "\nRETAINED TRANSPARENCY ANCHOR RESUME\n" + resume_output
+                print("PASS: a fresh Android coordinator resumed the new signed transparency suffix from its previously verified non-zero anchor",flush=True)
             else:
                 _, output = instrumentation()
         finally:
@@ -401,6 +779,53 @@ def run(args):
                 if handoff.failure is not None:
                     raise handoff.failure
             raise RuntimeError("Actual Android integration test did not pass")
+        if args.transparency_anchor_resume:
+            observations = relay.transparency_entries_observations
+            anchor = re.search(r"pallasync_transparency_anchor_resume=(\d+):(\d+)",output)
+            if anchor is None:
+                raise RuntimeError("Android did not report verified anchor/target indexes: " + output[-4000:])
+            anchor_index, target_index = (int(value) for value in anchor.groups())
+            after_hash = re.search(r"pallasync_transparency_anchor_resume_hash=([A-Za-z0-9_-]{43})", output)
+            first_query = parse_qs(urlsplit(observations[0]["path"]).query) if observations else {}
+            if args.transparency_anchor_cancel_resume:
+                cancelled = re.search(r"pallasync_transparency_anchor_cancel=(\d+):(\d+)",output)
+                if cancelled is None or tuple(map(int,cancelled.groups())) != (anchor_index+1,target_index):
+                    raise RuntimeError("Android did not retain the exact partial probe checkpoint on cancellation: " + output[-4000:])
+                after_indexes = [anchor_index] + [anchor_index+1] * (len(observations)-1)
+                cursors_valid = (
+                    len(observations) >= 2
+                    and observations[0]["next_cursor"] is not None
+                    and not observations[1]["query"].get("cursor")
+                    and all(observations[index+1]["query"].get("cursor") == [item["next_cursor"]]
+                            for index,item in enumerate(observations[1:-1],start=1))
+                )
+            else:
+                after_indexes = [anchor_index] * len(observations)
+                cursors_valid = all(observations[index+1]["query"].get("cursor") == [item["next_cursor"]]
+                                    for index,item in enumerate(observations[:-1]))
+            if (
+                not observations
+                or anchor_index <= 0
+                or target_index <= anchor_index
+                or first_query.get("after_index") != [str(anchor_index)]
+                or first_query.get("cursor")
+                or target_index != target_head["entry_index"]
+                or after_hash is None or after_hash.group(1) != target_head["transparency_hash"]
+                or len(observations) != target_index - anchor_index
+                or any(item["status"] != 200 for item in observations)
+                or any(item["query"].get("after_index") != [str(after)]
+                       or item["query"].get("through_index") != [str(target_index)]
+                       or item["query"].get("limit") != ["1"] for item,after in zip(observations,after_indexes))
+                or not cursors_valid
+                or observations[-1]["next_cursor"] is not None
+            ):
+                raise RuntimeError("Android skipped/rewound its retained transparency anchor or changed the signed target: " + repr(observations))
+            print(
+                f"PASS: verified retained anchor {anchor_index} advanced to signed target {target_index} in exactly {len(observations)} one-entry pages, with matching Android/Python target hashes and no prefix replay"
+                + ("; cancellation preserved partial progress and resumed at the next verified index" if args.transparency_anchor_cancel_resume else "; cursor links remained contiguous"),
+                flush=True,
+            )
+            return
         if handoff is not None:
             handoff.finish()
         if args.records_413_split:
@@ -466,6 +891,59 @@ def run(args):
             ):
                 raise RuntimeError("Android did not retry the exact receipt lookup after the missing-evidence backoff: " + repr(observations))
             print("PASS: Android retained pending acceptance evidence and retried the exact receipt GET after backoff; the isolated relay then returned the signed receipt",flush=True)
+        if args.pending_evidence_withhold:
+            if "pallasync_pending_evidence_withhold=preserved_then_recovered" not in output:
+                raise RuntimeError("Android did not retain and later recover pending inbox evidence")
+            observations = relay.pending_evidence_withhold_observations
+            injected = [item for item in observations if item["outcome"] == "injected_503"]
+            forwarded = [item for item in observations if item["outcome"] == "forwarded"]
+            before, missing, resumed = observations[:3] if len(observations) >= 3 else (None, None, None)
+            before_query = parse_qs(urlsplit(before["path"]).query) if before else {}
+            missing_query = parse_qs(urlsplit(missing["path"]).query) if missing else {}
+            resumed_query = parse_qs(urlsplit(resumed["path"]).query) if resumed else {}
+            through_values = {
+                parse_qs(urlsplit(item["path"]).query).get("through_index", [None])[0]
+                for item in observations
+            }
+            if (
+                len(injected) != 1
+                or len(observations) != 3
+                or [item["outcome"] for item in observations] != ["forwarded", "injected_503", "forwarded"]
+                or injected[0]["method"] != "GET"
+                or before["method"] != "GET" or before["status"] != 200
+                or resumed["method"] != "GET" or resumed["status"] != 200
+                or injected[0]["path"].split("?",1)[0].split("/")[-2:] != ["transparency","entries"]
+                or before_query.get("after_index") != ["0"]
+                or before_query.get("cursor")
+                or not missing_query.get("cursor")
+                or resumed_query.get("after_index") != ["1"]
+                or resumed_query.get("cursor")
+                or len(through_values) != 1
+            ):
+                raise RuntimeError("Android did not retain the partial transparency checkpoint and resume at the next index after a missing page: " + repr(observations))
+            print("PASS: Android retained a verified first page and the unchanged pending record when the next page returned 503; retry resumed at after_index=1, restored proof and materialized the record",flush=True)
+        if args.transparency_page_gap:
+            if "pallasync_transparency_page_gap=preserved_then_recovered" not in output:
+                raise RuntimeError("Android did not retain and recover after an incomplete transparency page")
+            observations = relay.pending_evidence_withhold_observations
+            if (
+                len(observations) != 3
+                or [item["outcome"] for item in observations] != ["forwarded","injected_missing_page","forwarded"]
+                or any(item["status"] != 200 or item["method"] != "GET" for item in observations)
+            ):
+                raise RuntimeError("The incomplete transparency page was not rejected and resumed: " + repr(observations))
+            before_query = parse_qs(urlsplit(observations[0]["path"]).query)
+            missing_query = parse_qs(urlsplit(observations[1]["path"]).query)
+            resumed_query = parse_qs(urlsplit(observations[2]["path"]).query)
+            if (
+                before_query.get("after_index") != ["0"] or before_query.get("cursor")
+                or not missing_query.get("cursor") or resumed_query.get("after_index") != ["1"]
+                or resumed_query.get("cursor") or len({
+                    parse_qs(urlsplit(item["path"]).query).get("through_index",[None])[0] for item in observations
+                }) != 1
+            ):
+                raise RuntimeError("Transparency page-gap retry changed the target or advanced past an unverified item: " + repr(observations))
+            print("PASS: Android rejected a 200 transparency page with its intermediate entry omitted, retained anchor 1 and the pending signed record, then resumed from after_index=1 and materialized after receiving the original signed entry",flush=True)
         if args.cursor_expired:
             if "pallasync_cursor_expired_recovery=passed" not in output:
                 raise RuntimeError("Android did not report a complete device-registry sync after cursor restart")
@@ -587,6 +1065,8 @@ def run(args):
             return
         if args.pruned_archive_probe:
             assert "pallasync_pruned_archive_probe=boundary_verified_and_restored" in output,"Android did not verify and restore the pruned archive"
+            if args.archive_deletion_race:
+                assert "pallasync_archive_deletion_race=blocked_for_transparency_dependency_with_state_retained" in output,"Android did not block the verified archive after the injected deletion"
             print("PASS: actual Android verified a pruned archive from its authenticated compaction boundary and restored the verified suffix",flush=True)
             return
         assert "pallasync_local_boundary=verified" in output,"No actual Android pre-persistence recovery-artifact boundary result"
@@ -729,9 +1209,17 @@ if __name__ == "__main__":
     parser.add_argument("--receipt-not-found",action="store_true",help="return one normative receipt-not-found response and verify Android retries the exact lookup after backoff")
     parser.add_argument("--receipt-not-found-process-death",action="store_true",help="kill Android after receipt absence and verify its persisted backoff/evidence resumes in a fresh process")
     parser.add_argument("--cursor-expired",action="store_true",help="inject one retryable CURSOR_EXPIRED during paginated device-registry sync and verify Android restarts from durable progress")
+    parser.add_argument("--pending-evidence-withhold",action="store_true",help="withhold one accepted record's historical transparency proof with a retryable 503, then verify pending state and later recovery")
     parser.add_argument("--reseed",action="store_true",help="run a two-relay Android generation+1 reseed cutover")
     parser.add_argument("--reseed-archive-probe",action="store_true",help="diagnose complete archive verification immediately after an isolated generation+1 cutover")
     parser.add_argument("--pruned-archive-probe",action="store_true",help="publish and prune an isolated normal chain, then verify and restore an archive requiring its trusted compaction boundary")
+    parser.add_argument("--archive-restore-process-death",action="store_true",help="kill Android after a pruned archive snapshot is installed, then verify a fresh process resumes and materializes it")
+    parser.add_argument("--archive-deletion-race",action="store_true",help="commit a signed admin deletion after archive verification but before snapshot installation, then verify Android blocks restore")
+    parser.add_argument("--transparency-recovery-process-death",action="store_true",help="kill Android after a verified historical transparency page commits to Room but before the protected resume anchor; verify replay after restart")
+    parser.add_argument("--transparency-recovery-cancel-resume",action="store_true",help="cancel Android at a verified transparency page checkpoint and verify pending-state resume across later one-entry pages")
+    parser.add_argument("--transparency-page-gap",action="store_true",help="omit a signed intermediate transparency entry from a relay page and verify the client does not advance its checkpoint")
+    parser.add_argument("--transparency-anchor-resume",action="store_true",help="append a Python-signed entry after Android has pinned a non-zero transparency prefix and verify Android reads only the suffix from that retained anchor")
+    parser.add_argument("--transparency-anchor-cancel-resume",action="store_true",help="with --transparency-anchor-resume, cancel the normal probe after its first durable page and resume the same signed target without replay")
     parser.add_argument("--reseed-split-view",action="store_true",help="serve one relay-signed contradictory transparency head after target-key acknowledgement and require quarantine without local cutover")
     parser.add_argument("--reseed-pre-capture-write",action="store_true",help="append an independent old-generation record after target key acknowledgement but before the final source capture; require a source-only unimported-edit report")
     parser.add_argument("--reseed-staging-write",action="store_true",help="append an independent old-generation record during target snapshot-part staging and require fail-closed local retention")

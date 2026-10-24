@@ -1,11 +1,12 @@
 """C.8 and §7.11 crypto checks against the document's public fixed inputs."""
 import copy
+import itertools
 import struct
 import unittest
 from pathlib import Path
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from nacl.bindings import crypto_aead_xchacha20poly1305_ietf_encrypt
-from protocol import b64, decode, digest, jcs, object_hash, strict_loads, verify
+from protocol import GF, b64, decode, digest, jcs, object_hash, strict_loads, verify
 from recovery_crypto import associated, offline_wrap_key, open_blob_identity, unwrap_share, portable, parse_portable, fragments, assemble_fragments
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -13,6 +14,66 @@ MNEMONIC = " ".join(["abandon"] * 23 + ["art"])
 
 
 class RecoveryCryptoTests(unittest.TestCase):
+    @staticmethod
+    def _reference_shares(secret, threshold, total):
+        """Independent test-only Shamir evaluation using galois.GF(256), poly 0x11b."""
+        import numpy as np
+
+        secret = GF(list(secret))
+        coefficients = GF(
+            np.array(
+                [[(row * 29 + column * 17 + threshold) & 0xFF for column in range(32)]
+                 for row in range(threshold - 1)],
+                dtype=np.uint8,
+            ),
+        )
+        shares = []
+        for index in range(1, total + 1):
+            x = GF(index)
+            power = GF(1)
+            share = secret.copy()
+            for coefficient in coefficients:
+                power *= x
+                share += coefficient * power
+            shares.append((index, share))
+        return shares
+
+    @staticmethod
+    def _reference_reconstruct(points):
+        import numpy as np
+
+        indices = GF([int(index) for index, _ in points])
+        shares = GF(np.array([list(map(int, share)) for _, share in points], dtype=np.uint8))
+        numerator = np.broadcast_to(indices[None, :], (len(points), len(points))).copy()
+        denominator = indices[:, None] + indices[None, :]
+        np.fill_diagonal(numerator, GF(1))
+        np.fill_diagonal(denominator, GF(1))
+        weights = np.prod(numerator / denominator, axis=1)
+        return (weights[:, None] * shares).sum(axis=0)
+
+    def test_c8_galois_reconstructs_every_three_of_five_fixed_share_subset(self):
+        vectors = (
+            "5b5c55524740494e63646d6a7f7871762b2c25223730393e13141d1a0f080106",
+            "3b3c35322720292e03040d0a1f1811164b4c45425750595e73747d7a6f686166",
+            "ecf9c6d3b8ad928744516e7b10053a2fa7b28d98f3e6d9cc0f1a25305b4e7164",
+            "8c99a6b3d8cdf2e724310e1b70655a4fc7d2edf89386b9ac6f7a45503b2e1104",
+        )
+        points = [(index + 2, GF(list(bytes.fromhex(value)))) for index, value in enumerate(vectors)]
+        points.insert(0, (1, GF(list(bytes.fromhex(
+            "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f"
+        )))))
+        for subset in itertools.combinations(points, 3):
+            self.assertEqual(bytes(int(value) for value in self._reference_reconstruct(subset)), bytes(range(32)))
+
+    def test_galois_profile_matrix_covers_every_valid_small_threshold(self):
+        secret = bytes((index * 7 + 0x31) & 0xFF for index in range(32))
+        profiles = [(threshold, total) for total in range(3, 9) for threshold in range(2, total)]
+        for threshold, total in profiles:
+            shares = self._reference_shares(secret, threshold, total)
+            for basis in itertools.combinations(shares, threshold):
+                self.assertEqual(bytes(int(value) for value in self._reference_reconstruct(basis)), secret,
+                                 f"profile {threshold}-of-{total}")
+
     def test_portable_canonical_package_and_numbered_fragments(self):
         package = strict_loads((FIXTURES / "recovery-package-c8.json").read_bytes())
         encoded = portable(package, self.admin)
